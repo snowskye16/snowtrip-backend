@@ -1,0 +1,16 @@
+# 🔐 Environment variables
+.env
+
+# 📦 Node modules
+node_modules/
+
+# 📊 Data files (optional)
+data/*.json
+
+# 🧾 Logs
+npm-debug.log
+yarn-error.log
+
+# 💻 OS files
+.DS_Store
+Thumbs.db
