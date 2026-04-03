@@ -13,8 +13,11 @@ app.set("trust proxy", 1);
 const PORT = Number(process.env.PORT || 3000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-const FREE_MODEL = process.env.FREE_MODEL || "gpt-4o-mini";
-const PREMIUM_MODEL = process.env.PREMIUM_MODEL || "gpt-4o";
+// Free = cheaper model
+const FREE_MODEL = process.env.FREE_MODEL || "gpt-5-mini";
+
+// Premium = stronger model
+const PREMIUM_MODEL = process.env.PREMIUM_MODEL || "gpt-5.4";
 
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 18000);
 const MAX_PROMPT_LENGTH = 2000;
@@ -69,12 +72,14 @@ Rules:
 - Make the output practical, clean, and mobile-friendly.
 - Use Day 1 / Day 2 / Day 3 headings.
 - Under each day, use Morning / Afternoon / Evening.
-- Suggest realistic Seoul-friendly routes.
+- Suggest realistic Korea-friendly routes.
+- Keep each day geographically efficient.
 - Include estimated budget notes in KRW when helpful.
 - Include transport tips.
 - Include 1-2 hidden gems only when relevant.
 - Keep the answer concise but useful.
 - Avoid filler text.
+- Do not invent exact prices or times when uncertain; use estimates.
 `;
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -123,26 +128,11 @@ async function callOpenAI({ prompt, premium }) {
       },
       body: JSON.stringify({
         model,
-        input: [
-          {
-            role: "developer",
-            content: [
-              {
-                type: "input_text",
-                text: DEVELOPER_PROMPT,
-              },
-            ],
-          },
-          {
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text: prompt,
-              },
-            ],
-          },
-        ],
+        instructions: DEVELOPER_PROMPT,
+        input: prompt,
+        reasoning: {
+          effort: premium ? "medium" : "low",
+        },
         max_output_tokens: premium ? 900 : 650,
       }),
     });
@@ -172,6 +162,8 @@ async function callOpenAI({ prompt, premium }) {
       result: text,
       model,
       tokens: data?.usage?.total_tokens || 0,
+      inputTokens: data?.usage?.input_tokens || 0,
+      outputTokens: data?.usage?.output_tokens || 0,
       responseId: data?.id || null,
     };
   } catch (error) {
@@ -239,6 +231,8 @@ app.post("/generate", async (req, res) => {
     result: result.result,
     model: result.model,
     tokens: result.tokens,
+    input_tokens: result.inputTokens,
+    output_tokens: result.outputTokens,
     latency_ms: Date.now() - startedAt,
     response_id: result.responseId,
   });
