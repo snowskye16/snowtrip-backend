@@ -1,19 +1,29 @@
 {
   "name": "snowtrip-backend",
   "version": "1.0.0",
-  "description": "",
+  "description": "SnowTrip backend API",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
-  "keywords": [],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "express",
+    "openai",
+    "travel",
+    "api",
+    "snowtrip"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^17.4.0",
     "express": "^5.2.1",
-    "node-fetch": "^3.3.2"
+    "express-rate-limit": "^8.1.0"
   }
 }
