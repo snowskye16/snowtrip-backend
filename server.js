@@ -17,20 +17,18 @@ const FREE_MODEL = process.env.FREE_MODEL || "gpt-5-mini";
 const PREMIUM_MODEL = process.env.PREMIUM_MODEL || "gpt-5.4";
 
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 45000);
-
-// App rules
 const MAX_PROMPT_LENGTH = Number(process.env.MAX_PROMPT_LENGTH || 3000);
 const MIN_DAYS = 1;
 const MAX_DAYS = 8;
 
 const FREE_MAX_DAYS = Number(process.env.FREE_MAX_DAYS || 2);
 const FREE_REQUESTS_PER_DAY = Number(process.env.FREE_REQUESTS_PER_DAY || 5);
-const FREE_WINDOW_MS =
-  Number(process.env.FREE_WINDOW_MS || 24 * 60 * 60 * 1000);
+const FREE_WINDOW_MS = Number(
+  process.env.FREE_WINDOW_MS || 24 * 60 * 60 * 1000,
+);
+const MAX_CITIES = Number(process.env.MAX_CITIES || 3);
 
-// In-memory free quota store
-// Good for MVP/local/one-server setups.
-// Later, move this to Redis or a database.
+// In-memory quota store for MVP / single server.
 const freeUsageByClient = new Map();
 
 // ── Middleware ─────────────────────────────────────────────────
@@ -59,10 +57,8 @@ app.use(
     },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Accept"],
-  })
+  }),
 );
-
-// ── Global Rate Limit ──────────────────────────────────────────
 
 const limiter = rateLimit({
   windowMs: 60 * 1000,
@@ -74,43 +70,46 @@ const limiter = rateLimit({
 
 app.use("/generate", limiter);
 
-// ── Prompt Rules ───────────────────────────────────────────────
+// ── Prompting ──────────────────────────────────────────────────
 
 const BASE_DEVELOPER_PROMPT = `
-You are SnowTrip AI, a premium Korea travel planner.
+You are SnowTrip AI, a Korea travel planner.
 
-Rules:
-- Make the output practical, clean, and mobile-friendly.
-- Use Day 1, Day 2, ... up to the number of days requested by the user.
-- Under each day, use Morning / Afternoon / Evening.
-- Suggest realistic routes for the requested city or cities in Korea.
-- Keep each day geographically efficient.
-- If there are multiple cities, clearly account for intercity transfer time.
-- Include estimated budget notes in KRW when helpful.
+Output rules:
+- Make the itinerary practical, clean, and mobile-friendly.
+- Use exactly: Day 1, Day 2, ... up to the requested number of days.
+- Under each day, always use: Morning, Afternoon, Evening.
+- Keep the route geographically efficient.
+- If there are multiple cities, clearly account for transfer time.
+- Include concise KRW budget notes.
 - Include transport tips.
-- Include 1 hidden gem only when relevant.
-- Keep the answer concise but useful.
-- Avoid filler text.
-- Do not invent exact prices or times when uncertain; use estimates.
+- Do not invent exact opening hours, train times, or exact prices when uncertain.
+- Prefer estimates and practical language.
 - Use short bullet points.
 - End with a short total trip budget estimate.
-`;
+- Never stop halfway through a day. If space is tight, simplify the plan instead of truncating it.
+`.trim();
 
 function buildDeveloperPrompt({ premium, requestedDays, isMultiCity }) {
   if (premium) {
     return `${BASE_DEVELOPER_PROMPT}
-- This is a premium request.
-- Provide fuller detail, smoother day flow, and slightly richer recommendations.
+
+Premium mode rules:
+- Provide fuller detail, smoother flow, and slightly richer food or hidden gem suggestions.
+- Keep the answer concise enough to fit fully.
 - Respect the requested trip length of ${requestedDays} day(s).
 - Multi-city mode: ${isMultiCity ? "yes" : "no"}.`;
   }
 
   return `${BASE_DEVELOPER_PROMPT}
-- This is a free request.
-- Keep the itinerary compact and efficient.
-- Respect the requested trip length of ${requestedDays} day(s).
-- Prioritize the best-value stops and avoid unnecessary detail.
-- Free requests are limited to short single-city plans.`;
+
+Free mode rules:
+- Keep the answer compact but complete.
+- Use at most 2 bullets per time block.
+- Prioritize the best-value stops.
+- Avoid extra commentary.
+- Free requests are for short single-city plans only.
+- Respect the requested trip length of ${requestedDays} day(s).`;
 }
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -128,7 +127,6 @@ function normalizeCityName(value) {
   if (!cleaned) return null;
 
   const lower = cleaned.toLowerCase();
-
   const aliases = new Map([
     ["seoul", "Seoul"],
     ["busan", "Busan"],
@@ -142,9 +140,7 @@ function normalizeCityName(value) {
     ["gyeongju", "Gyeongju"],
   ]);
 
-  if (aliases.has(lower)) {
-    return aliases.get(lower);
-  }
+  if (aliases.has(lower)) return aliases.get(lower);
 
   return cleaned
     .split(" ")
@@ -156,23 +152,14 @@ function normalizeCityName(value) {
 function normalizeCities({ city, cities }) {
   const raw = [];
 
-  if (Array.isArray(cities)) {
-    raw.push(...cities);
-  }
+  if (Array.isArray(cities)) raw.push(...cities);
+  if (typeof city === "string" && city.trim()) raw.push(city);
 
-  if (typeof city === "string" && city.trim()) {
-    raw.push(city);
-  }
-
-  const normalized = raw
-    .map(normalizeCityName)
-    .filter(Boolean);
-
+  const normalized = raw.map(normalizeCityName).filter(Boolean);
   const unique = [];
+
   for (const item of normalized) {
-    if (!unique.includes(item)) {
-      unique.push(item);
-    }
+    if (!unique.includes(item)) unique.push(item);
   }
 
   return unique;
@@ -180,19 +167,17 @@ function normalizeCities({ city, cities }) {
 
 function validateStructuredRequest({ days, city, cities, budget_krw }) {
   const requestedDays = clampNumber(days, MIN_DAYS, MAX_DAYS, NaN);
-
   if (!Number.isFinite(requestedDays)) {
     return { error: "Invalid days value." };
   }
 
   const normalizedCities = normalizeCities({ city, cities });
-
   if (normalizedCities.length === 0) {
     return { error: "Please provide at least one city." };
   }
 
-  if (normalizedCities.length > 3) {
-    return { error: "Maximum 3 cities per trip request." };
+  if (normalizedCities.length > MAX_CITIES) {
+    return { error: `Maximum ${MAX_CITIES} cities per trip request.` };
   }
 
   const budgetKrw = clampNumber(budget_krw ?? 0, 0, 50000000, 0);
@@ -217,13 +202,13 @@ Traveler style: ${
   }
 Budget: ${budgetKrw > 0 ? `₩${Math.round(budgetKrw)}` : "Not set"}
 
-Output format:
-- Use Day 1 to Day ${requestedDays}
+Required format:
+- Day 1 to Day ${requestedDays}
 - Morning / Afternoon / Evening
-- Practical routes
+- Practical route flow
 - KRW budget notes
 - Transport tips
-- Mention intercity transport if the itinerary includes multiple cities
+- Mention intercity transport if multiple cities are included
 - End with a short total trip budget estimate
 `.trim();
 }
@@ -233,26 +218,25 @@ function extractResponseText(data) {
     return data.output_text.trim();
   }
 
-  const text =
+  return (
     data?.output
       ?.flatMap((item) => item?.content || [])
       ?.filter((part) => part?.type === "output_text")
       ?.map((part) => part?.text || "")
       ?.join("\n")
-      ?.trim() || "";
-
-  return text;
+      ?.trim() || ""
+  );
 }
 
 function getMaxOutputTokens({ requestedDays, premium, isMultiCity }) {
   if (premium) {
-    const base = isMultiCity ? 1100 : 850;
+    const base = isMultiCity ? 1200 : 950;
     const perDay = isMultiCity ? 220 : 180;
-    return Math.min(2400, base + requestedDays * perDay);
+    return Math.min(2600, base + requestedDays * perDay);
   }
 
-  // Free is only 1–2 days, so we can allow a bit more room
-  return Math.min(1200, 700 + requestedDays * 180);
+  // Give free mode enough room to finish instead of clipping mid-plan.
+  return Math.min(1600, 900 + requestedDays * 220);
 }
 
 function getClientId(req) {
@@ -260,7 +244,6 @@ function getClientId(req) {
   if (typeof forwarded === "string" && forwarded.trim()) {
     return forwarded.split(",")[0].trim();
   }
-
   return req.ip || req.socket?.remoteAddress || "unknown";
 }
 
@@ -300,6 +283,49 @@ function consumeFreeQuota(clientId) {
   return getFreeQuotaStatus(clientId);
 }
 
+function looksIncomplete({ text, requestedDays }) {
+  if (!text || typeof text !== "string") return true;
+
+  const trimmed = text.trim();
+  if (trimmed.length < 80) return true;
+
+  const hasLastDay = trimmed.includes(`Day ${requestedDays}`);
+  const hasBudgetEnding = /total trip budget estimate/i.test(trimmed);
+  const endsCleanly = /[.!?)]$/.test(trimmed) || trimmed.endsWith("KRW");
+
+  if (!hasLastDay) return true;
+  if (!hasBudgetEnding && !endsCleanly) return true;
+
+  return false;
+}
+
+async function createResponse({
+  model,
+  instructions,
+  input,
+  reasoningEffort,
+  maxOutputTokens,
+  previousResponseId,
+  signal,
+}) {
+  return fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    signal,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      instructions,
+      input,
+      previous_response_id: previousResponseId,
+      reasoning: { effort: reasoningEffort },
+      max_output_tokens: maxOutputTokens,
+    }),
+  });
+}
+
 async function callOpenAI({
   userPrompt,
   premium,
@@ -320,24 +346,16 @@ async function callOpenAI({
     premium,
     isMultiCity,
   });
+  const reasoningEffort = premium ? "medium" : "low";
 
   try {
-    const response = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
+    const response = await createResponse({
+      model,
+      instructions,
+      input: userPrompt,
+      reasoningEffort,
+      maxOutputTokens,
       signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model,
-        instructions,
-        input: userPrompt,
-        reasoning: {
-          effort: premium ? "medium" : "low",
-        },
-        max_output_tokens: maxOutputTokens,
-      }),
     });
 
     const data = await response.json().catch(() => ({}));
@@ -345,7 +363,6 @@ async function callOpenAI({
     if (!response.ok) {
       console.error("OpenAI error status:", response.status);
       console.error("OpenAI error body:", JSON.stringify(data, null, 2));
-
       return {
         ok: false,
         status: response.status,
@@ -353,7 +370,44 @@ async function callOpenAI({
       };
     }
 
-    const text = extractResponseText(data);
+    let text = extractResponseText(data);
+    let finalData = data;
+
+    const incompleteReason = data?.incomplete_details?.reason || null;
+    const shouldContinue =
+      incompleteReason === "max_output_tokens" ||
+      looksIncomplete({ text, requestedDays });
+
+    if (shouldContinue && data?.id) {
+      const continuationResponse = await createResponse({
+        model,
+        instructions,
+        input:
+          "Continue from the exact point where the itinerary stopped. Do not repeat earlier text. Finish the remaining days and end with a short total trip budget estimate.",
+        previousResponseId: data.id,
+        reasoningEffort: premium ? "low" : "low",
+        maxOutputTokens: premium ? 900 : 700,
+        signal: controller.signal,
+      });
+
+      const continuationData = await continuationResponse
+        .json()
+        .catch(() => ({}));
+
+      if (continuationResponse.ok) {
+        const continuedText = extractResponseText(continuationData);
+        if (continuedText) {
+          text = `${text}\n${continuedText}`.trim();
+          finalData = continuationData;
+        }
+      } else {
+        console.error(
+          "OpenAI continuation error:",
+          continuationResponse.status,
+          JSON.stringify(continuationData, null, 2),
+        );
+      }
+    }
 
     if (!text) {
       return {
@@ -367,10 +421,17 @@ async function callOpenAI({
       ok: true,
       result: text,
       model,
-      tokens: data?.usage?.total_tokens || 0,
-      inputTokens: data?.usage?.input_tokens || 0,
-      outputTokens: data?.usage?.output_tokens || 0,
-      responseId: data?.id || null,
+      tokens:
+        (data?.usage?.total_tokens || 0) +
+        ((finalData !== data ? finalData?.usage?.total_tokens : 0) || 0),
+      inputTokens:
+        (data?.usage?.input_tokens || 0) +
+        ((finalData !== data ? finalData?.usage?.input_tokens : 0) || 0),
+      outputTokens:
+        (data?.usage?.output_tokens || 0) +
+        ((finalData !== data ? finalData?.usage?.output_tokens : 0) || 0),
+      responseId: finalData?.id || data?.id || null,
+      incompleteReason,
     };
   } catch (error) {
     console.error("callOpenAI crashed:", error);
@@ -412,13 +473,14 @@ app.get("/health", (_req, res) => {
     free_max_days: FREE_MAX_DAYS,
     free_requests_per_day: FREE_REQUESTS_PER_DAY,
     max_days: MAX_DAYS,
+    max_cities: MAX_CITIES,
   });
 });
 
 app.post("/generate", async (req, res) => {
   const startedAt = Date.now();
-
   const premium = req.body?.premium === true;
+
   const structured = validateStructuredRequest({
     days: req.body?.days,
     city: req.body?.city,
@@ -455,7 +517,8 @@ app.post("/generate", async (req, res) => {
 
   if (!premium && isMultiCity) {
     return res.status(403).json({
-      error: "Multi-city trips require premium. Free plan supports single-city trips only.",
+      error:
+        "Multi-city trips require premium. Free plan supports single-city trips only.",
       requested_days: requestedDays,
       cities,
       requires_premium: true,
@@ -464,8 +527,10 @@ app.post("/generate", async (req, res) => {
   }
 
   let freeQuota = null;
+  let clientId = null;
+
   if (!premium) {
-    const clientId = getClientId(req);
+    clientId = getClientId(req);
     freeQuota = getFreeQuotaStatus(clientId);
 
     if (freeQuota.remaining <= 0) {
@@ -510,8 +575,7 @@ app.post("/generate", async (req, res) => {
   }
 
   let updatedFreeQuota = null;
-  if (!premium) {
-    const clientId = getClientId(req);
+  if (!premium && clientId) {
     updatedFreeQuota = consumeFreeQuota(clientId);
   }
 
@@ -525,6 +589,7 @@ app.post("/generate", async (req, res) => {
     tokens: result.tokens,
     input_tokens: result.inputTokens,
     output_tokens: result.outputTokens,
+    incomplete_reason: result.incompleteReason,
     latency_ms: Date.now() - startedAt,
     response_id: result.responseId,
     free_quota: updatedFreeQuota,
