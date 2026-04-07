@@ -248,6 +248,7 @@ function getClientId(req) {
   if (typeof forwarded === "string" && forwarded.trim()) {
     return forwarded.split(",")[0].trim();
   }
+
   return req.ip || req.socket?.remoteAddress || "unknown";
 }
 
@@ -458,6 +459,57 @@ async function callOpenAI({
   }
 }
 
+function runMiddleware(req, res, middleware) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const done = (err) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve();
+    };
+
+    try {
+      const maybePromise = middleware(req, res, done);
+
+      if (maybePromise && typeof maybePromise.then === "function") {
+        maybePromise.then(() => done()).catch(reject);
+      }
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+async function premiumOnlyGuards(req, res, next) {
+  const premium = req.body?.premium === true;
+
+  if (!premium) {
+    req.user = null;
+    req.premiumCredit = null;
+    return next();
+  }
+
+  try {
+    await runMiddleware(req, res, optionalFirebaseAuth);
+    if (res.headersSent) return;
+
+    await runMiddleware(req, res, reservePremiumCreditIfNeeded);
+    if (res.headersSent) return;
+
+    if (!req.user?.uid) {
+      return res.status(401).json({
+        error: "Premium requires a valid Firebase sign-in.",
+      });
+    }
+
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+
 // ── Routes ─────────────────────────────────────────────────────
 
 app.get("/", (_req, res) => {
@@ -481,151 +533,158 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.post(
-  "/generate",
-  optionalFirebaseAuth,
-  reservePremiumCreditIfNeeded,
-  async (req, res) => {
-    const startedAt = Date.now();
-    const premium = req.body?.premium === true;
+app.post("/generate", premiumOnlyGuards, async (req, res) => {
+  const startedAt = Date.now();
+  const premium = req.body?.premium === true;
 
-    const structured = validateStructuredRequest({
-      days: req.body?.days,
-      city: req.body?.city,
-      cities: req.body?.cities,
-      budget_krw: req.body?.budget_krw,
-    });
+  const structured = validateStructuredRequest({
+    days: req.body?.days,
+    city: req.body?.city,
+    cities: req.body?.cities,
+    budget_krw: req.body?.budget_krw,
+  });
 
-    const refundIfNeeded = async (reason) => {
-      if (premium && req.premiumCredit?.reserved && req.user?.uid) {
-        try {
-          await refundPremiumCredit({
-            uid: req.user.uid,
-            requestId: req.premiumCredit.requestId,
-            reason,
-          });
-        } catch (error) {
-          console.error("refund failed:", error);
-        }
-      }
-    };
-
-    if (structured.error) {
-      await refundIfNeeded("validation_failed");
-      return res.status(400).json({
-        error: structured.error,
-        latency_ms: Date.now() - startedAt,
-      });
-    }
-
-    if (!OPENAI_API_KEY) {
-      await refundIfNeeded("missing_api_key");
-      return res.status(500).json({
-        error: "Missing API key.",
-        latency_ms: Date.now() - startedAt,
-      });
-    }
-
-    const { requestedDays, cities, budgetKrw } = structured;
-    const isMultiCity = cities.length > 1;
-
-    if (!premium && requestedDays > FREE_MAX_DAYS) {
-      return res.status(403).json({
-        error: `Free plan supports up to ${FREE_MAX_DAYS} days only. Upgrade to premium for ${requestedDays}-day trips.`,
-        requested_days: requestedDays,
-        cities,
-        requires_premium: true,
-        latency_ms: Date.now() - startedAt,
-      });
-    }
-
-    if (!premium && isMultiCity) {
-      return res.status(403).json({
-        error:
-          "Multi-city trips require premium. Free plan supports single-city trips only.",
-        requested_days: requestedDays,
-        cities,
-        requires_premium: true,
-        latency_ms: Date.now() - startedAt,
-      });
-    }
-
-    let freeQuota = null;
-    let clientId = null;
-
-    if (!premium) {
-      clientId = getClientId(req);
-      freeQuota = getFreeQuotaStatus(clientId);
-
-      if (freeQuota.remaining <= 0) {
-        return res.status(429).json({
-          error: `Free plan limit reached. You can generate up to ${FREE_REQUESTS_PER_DAY} free plans every 24 hours.`,
-          requested_days: requestedDays,
-          cities,
-          free_quota: freeQuota,
-          latency_ms: Date.now() - startedAt,
+  const refundIfNeeded = async (reason) => {
+    if (premium && req.premiumCredit?.reserved && req.user?.uid) {
+      try {
+        await refundPremiumCredit({
+          uid: req.user.uid,
+          requestId: req.premiumCredit.requestId,
+          reason,
         });
+      } catch (error) {
+        console.error("refund failed:", error);
       }
     }
+  };
 
-    const userPrompt = buildUserPrompt({
-      requestedDays,
-      cities,
-      budgetKrw,
-      premium,
+  if (structured.error) {
+    await refundIfNeeded("validation_failed");
+    return res.status(400).json({
+      error: structured.error,
+      latency_ms: Date.now() - startedAt,
     });
+  }
 
-    if (userPrompt.length > MAX_PROMPT_LENGTH) {
-      await refundIfNeeded("prompt_too_long");
-      return res.status(400).json({
-        error: "Prompt too long.",
-        latency_ms: Date.now() - startedAt,
-      });
-    }
-
-    const result = await callOpenAI({
-      userPrompt,
-      premium,
-      requestedDays,
-      isMultiCity,
+  if (!OPENAI_API_KEY) {
+    await refundIfNeeded("missing_api_key");
+    return res.status(500).json({
+      error: "Missing API key.",
+      latency_ms: Date.now() - startedAt,
     });
+  }
 
-    if (!result.ok) {
-      await refundIfNeeded("generate_failed");
-      return res.status(result.status).json({
-        error: result.error,
-        requested_days: requestedDays,
-        cities,
-        latency_ms: Date.now() - startedAt,
-      });
-    }
+  const { requestedDays, cities, budgetKrw } = structured;
+  const isMultiCity = cities.length > 1;
 
-    let updatedFreeQuota = null;
-    if (!premium && clientId) {
-      updatedFreeQuota = consumeFreeQuota(clientId);
-    }
-
-    return res.json({
-      result: result.result,
-      model: result.model,
+  if (!premium && requestedDays > FREE_MAX_DAYS) {
+    return res.status(403).json({
+      error: `Free plan supports up to ${FREE_MAX_DAYS} days only. Upgrade to premium for ${requestedDays}-day trips.`,
       requested_days: requestedDays,
       cities,
-      is_multi_city: isMultiCity,
-      plan_type: premium ? "premium" : "free",
-      tokens: result.tokens,
-      input_tokens: result.inputTokens,
-      output_tokens: result.outputTokens,
-      incomplete_reason: result.incompleteReason,
+      requires_premium: true,
       latency_ms: Date.now() - startedAt,
-      response_id: result.responseId,
-      free_quota: updatedFreeQuota,
-      premium_credits_remaining: premium
-        ? req.premiumCredit?.balanceAfter ?? null
-        : null,
-      uid: req.user?.uid ?? null,
     });
-  },
-);
+  }
+
+  if (!premium && isMultiCity) {
+    return res.status(403).json({
+      error:
+        "Multi-city trips require premium. Free plan supports single-city trips only.",
+      requested_days: requestedDays,
+      cities,
+      requires_premium: true,
+      latency_ms: Date.now() - startedAt,
+    });
+  }
+
+  let freeQuota = null;
+  let clientId = null;
+
+  if (!premium) {
+    clientId = getClientId(req);
+    freeQuota = getFreeQuotaStatus(clientId);
+
+    if (freeQuota.remaining <= 0) {
+      return res.status(429).json({
+        error: `Free plan limit reached. You can generate up to ${FREE_REQUESTS_PER_DAY} free plans every 24 hours.`,
+        requested_days: requestedDays,
+        cities,
+        free_quota: freeQuota,
+        latency_ms: Date.now() - startedAt,
+      });
+    }
+  }
+
+  const userPrompt = buildUserPrompt({
+    requestedDays,
+    cities,
+    budgetKrw,
+    premium,
+  });
+
+  if (userPrompt.length > MAX_PROMPT_LENGTH) {
+    await refundIfNeeded("prompt_too_long");
+    return res.status(400).json({
+      error: "Prompt too long.",
+      latency_ms: Date.now() - startedAt,
+    });
+  }
+
+  const result = await callOpenAI({
+    userPrompt,
+    premium,
+    requestedDays,
+    isMultiCity,
+  });
+
+  if (!result.ok) {
+    await refundIfNeeded("generate_failed");
+    return res.status(result.status).json({
+      error: result.error,
+      requested_days: requestedDays,
+      cities,
+      latency_ms: Date.now() - startedAt,
+    });
+  }
+
+  let updatedFreeQuota = null;
+  if (!premium && clientId) {
+    updatedFreeQuota = consumeFreeQuota(clientId);
+  }
+
+  return res.json({
+    result: result.result,
+    model: result.model,
+    requested_days: requestedDays,
+    cities,
+    is_multi_city: isMultiCity,
+    plan_type: premium ? "premium" : "free",
+    tokens: result.tokens,
+    input_tokens: result.inputTokens,
+    output_tokens: result.outputTokens,
+    incomplete_reason: result.incompleteReason,
+    latency_ms: Date.now() - startedAt,
+    response_id: result.responseId,
+    free_quota: updatedFreeQuota,
+    premium_credits_remaining: premium
+      ? req.premiumCredit?.balanceAfter ?? null
+      : null,
+    uid: req.user?.uid ?? null,
+  });
+});
+
+// ── Error Handler ──────────────────────────────────────────────
+
+app.use((err, _req, res, _next) => {
+  console.error("EXPRESS ERROR:", err);
+
+  if (res.headersSent) return;
+
+  return res.status(err?.status || 500).json({
+    error: err?.message || "Server error.",
+  });
+});
 
 // ── Crash Logging ──────────────────────────────────────────────
 
