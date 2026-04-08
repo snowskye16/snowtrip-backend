@@ -2,11 +2,13 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
+import { listTodayItems } from './src/airtableToday.js';
 import {
   optionalFirebaseAuth,
   reservePremiumCreditIfNeeded,
   refundPremiumCredit,
 } from "./premiumAuth.js";
+
 
 dotenv.config();
 
@@ -517,6 +519,19 @@ app.get("/", (_req, res) => {
     name: "SnowTrip API",
     status: "running",
   });
+});
+app.get('/today-items', async (req, res) => {
+  try {
+    const city =
+      typeof req.query.city === 'string' ? req.query.city.trim() : '';
+
+    const items = await listTodayItems({ city });
+
+    res.json({ items });
+  } catch (error) {
+    console.error('GET /today-items failed:', error);
+    res.status(500).json({ error: 'Could not load today items' });
+  }
 });
 
 app.get("/health", (_req, res) => {
