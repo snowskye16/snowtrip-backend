@@ -38,7 +38,7 @@ const MAX_CITIES = Number(process.env.MAX_CITIES || 3);
 // In-memory quota store for MVP / single server.
 const freeUsageByClient = new Map();
 
-// ── Middleware ─────────────────────────────────────────────────
+// ── Middleware upgrade ─────────────────────────────────────────────────
 
 app.use(express.json({ limit: "25kb" }));
 
