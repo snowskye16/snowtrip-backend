@@ -3,7 +3,7 @@ import 'dotenv/config';
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID;
 const AIRTABLE_TABLE_ID = process.env.AIRTABLE_TABLE_ID;
 const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
-const AIRTABLE_VIEW = process.env.AIRTABLE_VIEW || 'Published';
+const AIRTABLE_VIEW = process.env.AIRTABLE_VIEW || 'Grid view';
 
 function requireEnv(value, name) {
   if (!value || !value.trim()) {
@@ -21,32 +21,61 @@ function getConfig() {
   };
 }
 
+function toStringValue(value, fallback = '') {
+  if (value === null || value === undefined) return fallback;
+  return String(value).trim();
+}
+
+function toBoolValue(value, fallback = false) {
+  if (value === null || value === undefined) return fallback;
+  return Boolean(value);
+}
+
+function toIntValue(value, fallback = 9999) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.floor(value);
+  }
+
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toTagsValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).where((item) => item.isNotEmpty);
+  }
+  return [];
+}
+
 function mapRecord(record) {
   const fields = record.fields || {};
-  const imageList = Array.isArray(fields.image) ? fields.image : [];
+  const imageList = Array.isArray(fields['Image']) ? fields['Image'] : [];
   const firstImage = imageList.length > 0 ? imageList[0] : null;
 
   return {
-    recordId: record.id,
-    slug: fields.slug ?? '',
-    city: fields.city ?? '',
-    type: fields.type ?? '',
-    section: fields.section ?? '',
-    title: fields.title ?? '',
-    subtitle: fields.subtitle ?? '',
-    description: fields.description ?? '',
-    area: fields.area ?? '',
-    priceLabel: fields.priceLabel ?? '',
-    badge: fields.badge ?? '',
-    searchQuery: fields.searchQuery ?? '',
-    emoji: fields.emoji ?? '📍',
-    tags: Array.isArray(fields.tags) ? fields.tags : [],
-    isBudgetPick: Boolean(fields.isBudgetPick),
-    isNightPick: Boolean(fields.isNightPick),
-    isPublished: Boolean(fields.isPublished),
-    sortOrder:
-      typeof fields.sortOrder === 'number' ? fields.sortOrder : 9999,
-    eventDate: fields.eventDate ?? '',
+    recordId: toStringValue(record.id),
+    slug: toStringValue(fields['Slug']),
+    city: toStringValue(fields['City']),
+    type: toStringValue(fields['Type']),
+    section: toStringValue(fields['Section']),
+    title: toStringValue(fields['Title']),
+    subtitle: toStringValue(fields['Subtitle']),
+    description: toStringValue(
+      fields['Full Description'] ?? fields['Short Description']
+    ),
+    area: toStringValue(fields['Area']),
+    priceLabel: toStringValue(fields['Price Label']),
+    badge: toStringValue(fields['Badge']),
+    searchQuery: toStringValue(fields['Search Query']),
+    emoji: toStringValue(fields['Emoji'], '📍'),
+    tags: Array.isArray(fields['Tags'])
+      ? fields['Tags'].map((item) => String(item))
+      : [],
+    isBudgetPick: toBoolValue(fields['Is Budget Pick']),
+    isNightPick: toBoolValue(fields['Is Night Pick']),
+    isPublished: toBoolValue(fields['Is Published'], true),
+    sortOrder: toIntValue(fields['Sort Order'], 9999),
+    eventDate: toStringValue(fields['Event Date']),
     imageUrl: firstImage?.url ?? null,
   };
 }
@@ -64,7 +93,7 @@ export async function listTodayItems({ city }) {
 
     url.searchParams.set('view', view);
     url.searchParams.set('pageSize', '100');
-    url.searchParams.set('sort[0][field]', 'sortOrder');
+    url.searchParams.set('sort[0][field]', 'Sort Order');
     url.searchParams.set('sort[0][direction]', 'asc');
 
     if (offset) {
@@ -81,6 +110,7 @@ export async function listTodayItems({ city }) {
     const data = await response.json();
 
     if (!response.ok) {
+      console.error('Airtable error body:', data);
       throw new Error(data?.error?.message || 'Failed to load Airtable records');
     }
 
@@ -90,9 +120,11 @@ export async function listTodayItems({ city }) {
     offset = data.offset;
   } while (offset);
 
+  const normalizedCity = typeof city === 'string' ? city.trim().toLowerCase() : '';
+
   return results.filter((item) => {
     if (!item.isPublished) return false;
-    if (city && item.city.toLowerCase() !== city.toLowerCase()) return false;
+    if (normalizedCity && item.city.toLowerCase() !== normalizedCity) return false;
     return true;
   });
 }

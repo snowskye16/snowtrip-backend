@@ -530,7 +530,10 @@ app.get('/today-items', async (req, res) => {
     res.json({ items });
   } catch (error) {
     console.error('GET /today-items failed:', error);
-    res.status(500).json({ error: 'Could not load today items' });
+    res.status(500).json({
+      error: 'Could not load today items',
+      details: error?.message || 'Unknown error',
+    });
   }
 });
 
