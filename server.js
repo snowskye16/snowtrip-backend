@@ -522,17 +522,13 @@ app.get("/", (_req, res) => {
 });
 app.get('/today-items', async (req, res) => {
   try {
-    const city =
-      typeof req.query.city === 'string' ? req.query.city.trim() : '';
-
-    const items = await listTodayItems({ city });
-
+    const items = await listTodayItems({ city: req.query.city });
     res.json({ items });
   } catch (error) {
-    console.error('GET /today-items failed:', error);
+    console.error('Could not load today items:', error);
     res.status(500).json({
       error: 'Could not load today items',
-      details: error?.message || 'Unknown error',
+      message: error.message,
     });
   }
 });

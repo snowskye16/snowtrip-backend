@@ -6,10 +6,10 @@ const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
 const AIRTABLE_VIEW = process.env.AIRTABLE_VIEW || 'Grid view';
 
 function requireEnv(value, name) {
-  if (!value || !value.trim()) {
+  if (!value || !String(value).trim()) {
     throw new Error(`Missing ${name}`);
   }
-  return value.trim();
+  return String(value).trim();
 }
 
 function getConfig() {
@@ -28,7 +28,14 @@ function toStringValue(value, fallback = '') {
 
 function toBoolValue(value, fallback = false) {
   if (value === null || value === undefined) return fallback;
-  return Boolean(value);
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1', 'yes', 'y'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'n', ''].includes(normalized)) return false;
+
+  return fallback;
 }
 
 function toIntValue(value, fallback = 9999) {
@@ -41,10 +48,11 @@ function toIntValue(value, fallback = 9999) {
 }
 
 function toTagsValue(value) {
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item)).where((item) => item.isNotEmpty);
-  }
-  return [];
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((item) => String(item).trim())
+    .filter((item) => item.length > 0);
 }
 
 function mapRecord(record) {
@@ -68,9 +76,7 @@ function mapRecord(record) {
     badge: toStringValue(fields['Badge']),
     searchQuery: toStringValue(fields['Search Query']),
     emoji: toStringValue(fields['Emoji'], '📍'),
-    tags: Array.isArray(fields['Tags'])
-      ? fields['Tags'].map((item) => String(item))
-      : [],
+    tags: toTagsValue(fields['Tags']),
     isBudgetPick: toBoolValue(fields['Is Budget Pick']),
     isNightPick: toBoolValue(fields['Is Night Pick']),
     isPublished: toBoolValue(fields['Is Published'], true),
@@ -104,6 +110,7 @@ export async function listTodayItems({ city }) {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
       },
     });
 
@@ -120,11 +127,14 @@ export async function listTodayItems({ city }) {
     offset = data.offset;
   } while (offset);
 
-  const normalizedCity = typeof city === 'string' ? city.trim().toLowerCase() : '';
+  const normalizedCity =
+    typeof city === 'string' ? city.trim().toLowerCase() : '';
 
   return results.filter((item) => {
     if (!item.isPublished) return false;
-    if (normalizedCity && item.city.toLowerCase() !== normalizedCity) return false;
+    if (normalizedCity && item.city.toLowerCase() !== normalizedCity) {
+      return false;
+    }
     return true;
   });
 }
