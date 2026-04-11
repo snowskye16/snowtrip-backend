@@ -5,6 +5,12 @@ import { getAuth } from "firebase-admin/auth";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
 function getFirebaseCredential() {
+  const localKeyPath = path.resolve(process.cwd(), "serviceAccountKey.json");
+  if (fs.existsSync(localKeyPath)) {
+    const raw = fs.readFileSync(localKeyPath, "utf8");
+    return cert(JSON.parse(raw));
+  }
+
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     const parsed = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
     if (typeof parsed.private_key === "string") {
@@ -16,12 +22,6 @@ function getFirebaseCredential() {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON_PATH) {
     const resolvedPath = path.resolve(process.cwd(), process.env.FIREBASE_SERVICE_ACCOUNT_JSON_PATH);
     const raw = fs.readFileSync(resolvedPath, "utf8");
-    return cert(JSON.parse(raw));
-  }
-
-  const localKeyPath = path.resolve(process.cwd(), "serviceAccountKey.json");
-  if (fs.existsSync(localKeyPath)) {
-    const raw = fs.readFileSync(localKeyPath, "utf8");
     return cert(JSON.parse(raw));
   }
 
