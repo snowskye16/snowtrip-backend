@@ -4,6 +4,14 @@ import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
 import { listTodayItems } from './src/airtableToday.js';
 import {
+  TodaySocialError,
+  createCommentReport,
+  createTodayComment,
+  listActiveComments,
+  softDeleteTodayComment,
+  toggleTodayLike,
+} from "./src/todaySocial.js";
+import {
   optionalFirebaseAuth,
   reservePremiumCreditIfNeeded,
   refundPremiumCredit,
@@ -62,7 +70,7 @@ app.use(
 
       return callback(new Error("Not allowed by CORS"));
     },
-    methods: ["GET", "POST", "OPTIONS"],
+    methods: ["GET", "POST", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Accept", "Authorization"],
   }),
 );
@@ -514,6 +522,45 @@ async function premiumOnlyGuards(req, res, next) {
 
 // ── Routes ─────────────────────────────────────────────────────
 
+function requireAuthenticatedUser(req, res, next) {
+  if (req.user?.uid) {
+    return next();
+  }
+
+  return res.status(401).json({
+    error: "Authentication required.",
+    requires_login: true,
+  });
+}
+
+function getUserDisplayName(req) {
+  const displayName = req.user?.displayName;
+  if (typeof displayName === "string" && displayName.trim()) {
+    return displayName.trim();
+  }
+
+  const email = req.user?.email;
+  if (typeof email === "string" && email.includes("@")) {
+    const localPart = email.split("@")[0]?.trim();
+    if (localPart) return localPart;
+  }
+
+  return "Traveler";
+}
+
+function handleTodaySocialError(res, error, fallbackMessage) {
+  if (error instanceof TodaySocialError) {
+    return res.status(error.status).json({
+      error: error.message,
+    });
+  }
+
+  console.error(fallbackMessage, error);
+  return res.status(500).json({
+    error: fallbackMessage,
+  });
+}
+
 app.get("/", (_req, res) => {
   res.json({
     name: "SnowTrip API",
@@ -532,6 +579,90 @@ app.get('/today-items', async (req, res) => {
     });
   }
 });
+
+app.get("/today-items/:id/comments", async (req, res) => {
+  try {
+    const comments = await listActiveComments(req.params.id);
+    return res.json({ comments });
+  } catch (error) {
+    return handleTodaySocialError(res, error, "Could not load comments.");
+  }
+});
+
+app.post(
+  "/today-items/:id/comments",
+  optionalFirebaseAuth,
+  requireAuthenticatedUser,
+  async (req, res) => {
+    try {
+      const comment = await createTodayComment({
+        featuredPlaceId: req.params.id,
+        userId: req.user.uid,
+        userDisplayName: getUserDisplayName(req),
+        text: req.body?.text,
+      });
+
+      return res.status(201).json({ comment });
+    } catch (error) {
+      return handleTodaySocialError(res, error, "Could not create comment.");
+    }
+  },
+);
+
+app.delete(
+  "/comments/:id",
+  optionalFirebaseAuth,
+  requireAuthenticatedUser,
+  async (req, res) => {
+    try {
+      await softDeleteTodayComment({
+        commentId: req.params.id,
+        userId: req.user.uid,
+      });
+
+      return res.json({ ok: true });
+    } catch (error) {
+      return handleTodaySocialError(res, error, "Could not delete comment.");
+    }
+  },
+);
+
+app.post(
+  "/comments/:id/report",
+  optionalFirebaseAuth,
+  requireAuthenticatedUser,
+  async (req, res) => {
+    try {
+      await createCommentReport({
+        commentId: req.params.id,
+        reporterUserId: req.user.uid,
+        reason: req.body?.reason,
+      });
+
+      return res.json({ ok: true });
+    } catch (error) {
+      return handleTodaySocialError(res, error, "Could not report comment.");
+    }
+  },
+);
+
+app.post(
+  "/today-items/:id/like",
+  optionalFirebaseAuth,
+  requireAuthenticatedUser,
+  async (req, res) => {
+    try {
+      const result = await toggleTodayLike({
+        featuredPlaceId: req.params.id,
+        userId: req.user.uid,
+      });
+
+      return res.json(result);
+    } catch (error) {
+      return handleTodaySocialError(res, error, "Could not update like.");
+    }
+  },
+);
 
 app.get("/health", (_req, res) => {
   res.json({

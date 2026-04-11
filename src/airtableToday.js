@@ -83,6 +83,9 @@ function mapRecord(record) {
     sortOrder: toIntValue(fields['Sort Order'], 9999),
     eventDate: toStringValue(fields['Event Date']),
     imageUrl: firstImage?.url ?? null,
+    likeCount: 0,
+    commentCount: 0,
+    isLiked: false,
   };
 }
 

@@ -55,6 +55,7 @@ export async function optionalFirebaseAuth(req, res, next) {
     req.user = {
       uid: decoded.uid,
       email: decoded.email || null,
+      displayName: decoded.name || null,
       isAnonymous: decoded.firebase?.sign_in_provider === "anonymous",
     };
 
