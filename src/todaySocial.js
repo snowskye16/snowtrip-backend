@@ -149,6 +149,7 @@ export async function listActiveComments(featuredPlaceId) {
 
   const snapshot = await commentsCollection()
     .where("featuredPlaceId", "==", normalizedFeaturedPlaceId)
+    .where("status", "==", COMMENT_STATUS_ACTIVE)
     .get();
 
   return snapshot.docs
@@ -160,7 +161,6 @@ export async function listActiveComments(featuredPlaceId) {
         createdAtMs: toMillis(data.createdAt),
       };
     })
-    .filter((entry) => entry.comment.status === COMMENT_STATUS_ACTIVE)
     .sort((a, b) => b.createdAtMs - a.createdAtMs)
     .map((entry) => entry.comment);
 }

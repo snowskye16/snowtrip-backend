@@ -585,7 +585,23 @@ app.get("/today-items/:id/comments", async (req, res) => {
     const comments = await listActiveComments(req.params.id);
     return res.json({ comments });
   } catch (error) {
-    return handleTodaySocialError(res, error, "Could not load comments.");
+    console.error(error?.stack || error);
+
+    if (error instanceof TodaySocialError) {
+      return res.status(error.status).json({
+        error: error.message,
+      });
+    }
+
+    const response = {
+      error: "Could not load comments.",
+    };
+
+    if (process.env.NODE_ENV !== "production") {
+      response.details = error?.message;
+    }
+
+    return res.status(500).json(response);
   }
 });
 

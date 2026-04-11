@@ -14,3 +14,7 @@ yarn-error.log
 # 💻 OS files
 .DS_Store
 Thumbs.db
+
+# Local Firebase admin key
+snowtrip-backend/serviceAccountKey.json
+serviceAccountKey.json
