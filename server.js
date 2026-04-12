@@ -46,6 +46,33 @@ const MAX_CITIES = Number(process.env.MAX_CITIES || 3);
 // In-memory quota store for MVP / single server.
 const freeUsageByClient = new Map();
 
+const TRAVELER_PRESET_GUIDANCE = new Map([
+  [
+    "First-time traveler",
+    "Prioritize Korea's most memorable first-visit highlights, easy orientation, and low-friction routing.",
+  ],
+  [
+    "Couple",
+    "Favor romantic pacing, scenic neighborhoods, sunset timing, cozy cafes, and date-friendly dinners.",
+  ],
+  [
+    "Budget traveler",
+    "Favor strong value, low-cost transport, free viewpoints, market meals, and smarter spend tradeoffs.",
+  ],
+  [
+    "Food lover",
+    "Anchor the day around signature local dishes, food streets, markets, cafes, and timing meals well.",
+  ],
+  [
+    "Family",
+    "Keep the day family-friendly with easy transitions, flexible timing, kid-friendly stops, and practical breaks.",
+  ],
+  [
+    "Luxury traveler",
+    "Favor polished neighborhoods, elevated dining, premium experiences, quieter pacing, and comfort-first flow.",
+  ],
+]);
+
 // ── Middleware upgrade ─────────────────────────────────────────────────
 
 app.use(express.json({ limit: "25kb" }));
@@ -96,33 +123,69 @@ Output rules:
 - Under each day, always use: Morning, Afternoon, Evening.
 - Keep the route geographically efficient.
 - If there are multiple cities, clearly account for transfer time.
-- Include concise KRW budget notes.
-- Include transport tips.
 - Do not invent exact opening hours, train times, or exact prices when uncertain.
 - Prefer estimates and practical language.
-- Use short bullet points.
+- Keep activities realistic for the time of day and transfer distance.
+- Group nearby places by area whenever possible.
+- Reduce unnecessary cross-neighborhood or cross-city backtracking.
+- Match the plan to the stated budget and traveler profile.
+- Always include at least one food suggestion per day.
+- Always include concise transport guidance.
 - End with a short total trip budget estimate.
 - Never stop halfway through a day. If space is tight, simplify the plan instead of truncating it.
 `.trim();
 
-function buildDeveloperPrompt({ premium, requestedDays, isMultiCity }) {
-  if (premium) {
+function buildDeveloperPrompt({
+  premium,
+  isTailored,
+  requestedDays,
+  isMultiCity,
+}) {
+  if (premium && isTailored) {
     return `${BASE_DEVELOPER_PROMPT}
 
-Premium mode rules:
-- Provide fuller detail, smoother flow, and slightly richer food or hidden gem suggestions.
-- Keep the answer concise enough to fit fully.
+Premium tailored mode rules:
+- This is the premium Trip Pass experience. Personalization depth matters.
+- Generate a Korea-specific itinerary tailored to travelerType, pace, interests, travelCompanions, specialNeeds, days, city/cities, and budget_krw.
+- Reflect premium trip style when the profile suggests it, while still staying realistic for the stated budget.
+- Include hidden gems or smart local picks when they improve the route.
+- Optimize transport flow and minimize wasteful transfers.
+- Honor Less walking, Near subway only, Rain-friendly, Indoor options, Kid-friendly, Late-night friendly, and Airport-day optimized whenever requested.
+- Keep the answer structured and easy to parse.
+- Start with exactly this block:
+Trip Summary
+- Tailored for: ...
+- Budget: ...
+- Route logic: ...
+- Then for every day use exactly this shape:
+Day N - [City]
+Morning:
+- ...
+Afternoon:
+- ...
+Evening:
+- ...
+Food pick: ...
+Transport tip: ...
+Estimated spend: ...
+Why this fits you: ...
+Rain backup: ...
+- Morning, Afternoon, and Evening should each have 1 to 2 short bullet points.
+- Use one city label in each day heading, even for single-city trips.
 - Respect the requested trip length of ${requestedDays} day(s).
-- Multi-city mode: ${isMultiCity ? "yes" : "no"}.`;
+- Multi-city mode: ${isMultiCity ? "yes" : "no"}.
+- End with a short total trip budget estimate.`;
   }
 
   return `${BASE_DEVELOPER_PROMPT}
 
-Free mode rules:
-- Keep the answer compact but complete.
-- Use at most 2 bullets per time block.
+Free basic mode rules:
+- Keep the answer simpler and more compact, but still complete.
+- Free mode should still use clear Day headings.
+- Under each day, use Morning, Afternoon, and Evening only.
+- Keep each time block to 1 to 2 short bullet points.
+- Do not include premium-only sections like Trip Summary, Why this fits you, or Rain backup.
 - Prioritize the best-value stops.
-- Avoid extra commentary.
 - Free requests are for short single-city plans only.
 - Respect the requested trip length of ${requestedDays} day(s).`;
 }
@@ -180,7 +243,177 @@ function normalizeCities({ city, cities }) {
   return unique;
 }
 
-function validateStructuredRequest({ days, city, cities, budget_krw }) {
+function sanitizeText(value, maxLength = 80) {
+  if (typeof value !== "string") return null;
+
+  const cleaned = value.replace(/\s+/g, " ").trim();
+  if (!cleaned) return null;
+
+  return cleaned.slice(0, maxLength);
+}
+
+function sanitizeList(value, { maxItems = 6, maxItemLength = 40 } = {}) {
+  const rawItems = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(",")
+      : [];
+
+  const items = [];
+
+  for (const rawItem of rawItems) {
+    const cleaned = sanitizeText(rawItem, maxItemLength);
+    if (!cleaned) continue;
+    if (items.includes(cleaned)) continue;
+    items.push(cleaned);
+    if (items.length >= maxItems) break;
+  }
+
+  return items;
+}
+
+function normalizeTravelerType(value) {
+  const cleaned = sanitizeText(value, 60);
+  if (!cleaned) return null;
+
+  const lower = cleaned.toLowerCase();
+  const aliases = new Map([
+    ["first-time traveler", "First-time traveler"],
+    ["first time traveler", "First-time traveler"],
+    ["first timer", "First-time traveler"],
+    ["couple", "Couple"],
+    ["budget traveler", "Budget traveler"],
+    ["budget traveller", "Budget traveler"],
+    ["food lover", "Food lover"],
+    ["family", "Family"],
+    ["luxury traveler", "Luxury traveler"],
+    ["luxury traveller", "Luxury traveler"],
+  ]);
+
+  return aliases.get(lower) || cleaned;
+}
+
+function normalizePace(value) {
+  const cleaned = sanitizeText(value, 30);
+  if (!cleaned) return null;
+
+  const lower = cleaned.toLowerCase();
+  if (["slow", "relaxed", "easy"].includes(lower)) return "Relaxed";
+  if (["moderate", "balanced", "medium"].includes(lower)) return "Balanced";
+  if (["fast", "packed", "active"].includes(lower)) return "Packed";
+
+  return cleaned;
+}
+
+function normalizeTravelCompanions(value) {
+  const cleaned = sanitizeText(value, 40);
+  if (!cleaned) return "Solo";
+
+  const lower = cleaned.toLowerCase();
+  const aliases = new Map([
+    ["solo", "Solo"],
+    ["couple", "Couple"],
+    ["friends", "Friends"],
+    ["friend group", "Friends"],
+    ["family", "Family"],
+  ]);
+
+  return aliases.get(lower) || "Solo";
+}
+
+function normalizeSpecialNeeds(value) {
+  const normalized = [];
+
+  for (const item of sanitizeList(value, { maxItems: 6, maxItemLength: 50 })) {
+    const lower = item.toLowerCase();
+
+    if (lower.includes("less walking")) {
+      if (!normalized.includes("Less walking")) normalized.push("Less walking");
+      continue;
+    }
+
+    if (lower.includes("near subway")) {
+      if (!normalized.includes("Near subway only")) {
+        normalized.push("Near subway only");
+      }
+      continue;
+    }
+
+    if (lower.includes("rain-friendly") || lower.includes("rain friendly")) {
+      if (!normalized.includes("Rain-friendly")) {
+        normalized.push("Rain-friendly");
+      }
+      continue;
+    }
+
+    if (lower.includes("indoor")) {
+      if (!normalized.includes("Indoor options")) {
+        normalized.push("Indoor options");
+      }
+      continue;
+    }
+
+    if (lower.includes("kid-friendly") || lower.includes("kid friendly")) {
+      if (!normalized.includes("Kid-friendly")) {
+        normalized.push("Kid-friendly");
+      }
+      continue;
+    }
+
+    if (
+      lower.includes("late-night friendly") ||
+      lower.includes("late night friendly")
+    ) {
+      if (!normalized.includes("Late-night friendly")) {
+        normalized.push("Late-night friendly");
+      }
+      continue;
+    }
+
+    if (
+      lower.includes("airport-day optimized") ||
+      lower.includes("airport day optimized")
+    ) {
+      if (!normalized.includes("Airport-day optimized")) {
+        normalized.push("Airport-day optimized");
+      }
+      continue;
+    }
+
+    normalized.push(item);
+  }
+
+  return normalized;
+}
+
+function normalizePremiumProfile({
+  travelerType,
+  pace,
+  interests,
+  travelCompanions,
+  specialNeeds,
+}) {
+  return {
+    travelerType: normalizeTravelerType(travelerType),
+    pace: normalizePace(pace),
+    interests: sanitizeList(interests, { maxItems: 8, maxItemLength: 32 }),
+    travelCompanions: normalizeTravelCompanions(travelCompanions),
+    specialNeeds: normalizeSpecialNeeds(specialNeeds),
+  };
+}
+
+function validateStructuredRequest({
+  days,
+  city,
+  cities,
+  budget_krw,
+  travelerType,
+  pace,
+  interests,
+  travelCompanions,
+  specialNeeds,
+  isTailored,
+}) {
   const requestedDays = clampNumber(days, MIN_DAYS, MAX_DAYS, NaN);
   if (!Number.isFinite(requestedDays)) {
     return { error: "Invalid days value." };
@@ -196,15 +429,24 @@ function validateStructuredRequest({ days, city, cities, budget_krw }) {
   }
 
   const budgetKrw = clampNumber(budget_krw ?? 0, 0, 50000000, 0);
+  const premiumProfile = normalizePremiumProfile({
+    travelerType,
+    pace,
+    interests,
+    travelCompanions,
+    specialNeeds,
+  });
 
   return {
     requestedDays,
     cities: normalizedCities,
     budgetKrw,
+    isTailored: isTailored === true,
+    premiumProfile,
   };
 }
 
-function buildUserPrompt({ requestedDays, cities, budgetKrw, premium }) {
+function legacyBuildUserPrompt({ requestedDays, cities, budgetKrw, premium }) {
   const isMultiCity = cities.length > 1;
 
   return `
@@ -228,6 +470,133 @@ Required format:
 `.trim();
 }
 
+function describeBudget({ budgetKrw, requestedDays }) {
+  if (!budgetKrw) return "Flexible or not set";
+
+  const dailyBudget = Math.round(budgetKrw / Math.max(1, requestedDays));
+
+  if (dailyBudget < 80000) {
+    return `Budget-conscious (about KRW ${dailyBudget.toLocaleString()} per day)`;
+  }
+
+  if (dailyBudget < 180000) {
+    return `Mid-range (about KRW ${dailyBudget.toLocaleString()} per day)`;
+  }
+
+  return `Higher-spend (about KRW ${dailyBudget.toLocaleString()} per day)`;
+}
+
+function buildPremiumProfileBlock(profile) {
+  const lines = [];
+
+  if (profile.travelerType) {
+    lines.push(`Traveler preset: ${profile.travelerType}`);
+
+    const presetGuidance = TRAVELER_PRESET_GUIDANCE.get(profile.travelerType);
+    if (presetGuidance) {
+      lines.push(`Preset guidance: ${presetGuidance}`);
+    }
+  }
+
+  if (profile.pace) lines.push(`Pace: ${profile.pace}`);
+  if (profile.interests.length > 0) {
+    lines.push(`Interests: ${profile.interests.join(", ")}`);
+  }
+  if (profile.travelCompanions) {
+    lines.push(`Travel companions: ${profile.travelCompanions}`);
+  }
+  if (profile.specialNeeds.length > 0) {
+    lines.push(`Special needs: ${profile.specialNeeds.join(", ")}`);
+  }
+
+  return lines.length > 0 ? lines.join("\n") : "No extra premium profile inputs provided.";
+}
+
+function buildUserPrompt({
+  requestedDays,
+  cities,
+  budgetKrw,
+  premium,
+  isTailored,
+  premiumProfile,
+}) {
+  const isMultiCity = cities.length > 1;
+  const budgetLabel =
+    budgetKrw > 0 ? `KRW ${Math.round(budgetKrw).toLocaleString()}` : "Not set";
+  const budgetDescription = describeBudget({ budgetKrw, requestedDays });
+
+  if (premium && isTailored) {
+    return `
+Create a tailored ${requestedDays}-day Korea itinerary for a Trip Pass premium user.
+
+Trip basics:
+- Cities: ${cities.join(", ")}
+- Trip type: ${isMultiCity ? "Multi-city" : "Single-city"}
+- Total budget: ${budgetLabel}
+- Budget level: ${budgetDescription}
+
+Premium traveler profile:
+${buildPremiumProfileBlock(premiumProfile)}
+
+Generation rules:
+- Group places by area whenever possible.
+- Reduce unnecessary cross-city or cross-neighborhood movement.
+- Avoid unrealistic schedules and leave enough transit and meal time.
+- Align activity choice and pacing to the traveler profile.
+- Match the itinerary to the real budget level.
+- Include food suggestions every day.
+- Include concise transport tips every day.
+- Honor Less walking, Near subway only, Rain-friendly, Indoor options, Kid-friendly, Late-night friendly, and Airport-day optimized when requested.
+- Build rainy-day fallbacks that still fit the same area or route.
+- Explain "Why this fits you" using the actual premium profile instead of generic praise.
+- Use Korea-specific neighborhoods, landmarks, food streets, museums, cafes, markets, and scenic spots.
+
+Required premium output format:
+Trip Summary
+- Tailored for: ...
+- Budget: ...
+- Route logic: ...
+
+Day 1 - [City]
+Morning:
+- ...
+Afternoon:
+- ...
+Evening:
+- ...
+Food pick: ...
+Transport tip: ...
+Estimated spend: ...
+Why this fits you: ...
+Rain backup: ...
+
+Repeat that exact day structure through Day ${requestedDays}.
+End with: Total trip budget estimate: ...
+`.trim();
+  }
+
+  return `
+Plan a ${requestedDays}-day Korea trip.
+
+Trip basics:
+- Cities: ${cities.join(", ")}
+- Trip type: ${isMultiCity ? "Multi-city" : "Single-city"}
+- Traveler style: basic / value / practical
+- Total budget: ${budgetLabel}
+- Budget level: ${budgetDescription}
+
+Required format:
+- Day 1 to Day ${requestedDays}
+- Use clear Day headings
+- Under each day, use Morning / Afternoon / Evening
+- Use 1 to 2 short bullet points per time block
+- Include Food pick: ...
+- Include Transport tip: ...
+- Include Budget note: ...
+- End with Total trip budget estimate: ...
+`.trim();
+}
+
 function extractResponseText(data) {
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
@@ -243,14 +612,22 @@ function extractResponseText(data) {
   );
 }
 
-function getMaxOutputTokens({ requestedDays, premium, isMultiCity }) {
-  if (premium) {
-    const base = isMultiCity ? 1200 : 950;
-    const perDay = isMultiCity ? 220 : 180;
-    return Math.min(2600, base + requestedDays * perDay);
+function getMaxOutputTokens({ requestedDays, premium, isTailored, isMultiCity }) {
+  if (premium && isTailored) {
+    const base = isMultiCity ? 1500 : 1250;
+    const perDay = isMultiCity ? 260 : 220;
+    return Math.min(3600, base + requestedDays * perDay);
   }
 
-  return Math.min(1600, 900 + requestedDays * 220);
+  return Math.min(1700, 950 + requestedDays * 190);
+}
+
+function buildContinuationPrompt({ premium, isTailored, requestedDays }) {
+  if (premium && isTailored) {
+    return `Continue from the exact point where the itinerary stopped. Do not repeat earlier text. Keep the same premium structure for the remaining days through Day ${requestedDays}. For each remaining day, include Morning, Afternoon, Evening, Food pick, Transport tip, Estimated spend, Why this fits you, and Rain backup. End with "Total trip budget estimate: ...".`;
+  }
+
+  return `Continue from the exact point where the itinerary stopped. Do not repeat earlier text. Finish the remaining Day blocks through Day ${requestedDays}. Keep Morning, Afternoon, Evening, Food pick, Transport tip, and Budget note. End with "Total trip budget estimate: ...".`;
 }
 
 function getClientId(req) {
@@ -344,6 +721,7 @@ async function createResponse({
 async function callOpenAI({
   userPrompt,
   premium,
+  isTailored,
   requestedDays,
   isMultiCity,
 }) {
@@ -353,15 +731,17 @@ async function callOpenAI({
   const model = premium ? PREMIUM_MODEL : FREE_MODEL;
   const instructions = buildDeveloperPrompt({
     premium,
+    isTailored,
     requestedDays,
     isMultiCity,
   });
   const maxOutputTokens = getMaxOutputTokens({
     requestedDays,
     premium,
+    isTailored,
     isMultiCity,
   });
-  const reasoningEffort = premium ? "medium" : "low";
+  const reasoningEffort = premium && isTailored ? "medium" : "low";
 
   try {
     const response = await createResponse({
@@ -397,11 +777,10 @@ async function callOpenAI({
       const continuationResponse = await createResponse({
         model,
         instructions,
-        input:
-          "Continue from the exact point where the itinerary stopped. Do not repeat earlier text. Finish the remaining days and end with a short total trip budget estimate.",
+        input: buildContinuationPrompt({ premium, isTailored, requestedDays }),
         previousResponseId: data.id,
         reasoningEffort: "low",
-        maxOutputTokens: premium ? 900 : 700,
+        maxOutputTokens: premium && isTailored ? 900 : 700,
         signal: controller.signal,
       });
 
@@ -703,6 +1082,12 @@ app.post("/generate", premiumOnlyGuards, async (req, res) => {
     city: req.body?.city,
     cities: req.body?.cities,
     budget_krw: req.body?.budget_krw,
+    travelerType: req.body?.travelerType,
+    pace: req.body?.pace,
+    interests: req.body?.interests,
+    travelCompanions: req.body?.travelCompanions,
+    specialNeeds: req.body?.specialNeeds,
+    isTailored: req.body?.isTailored,
   });
 
   const refundIfNeeded = async (reason) => {
@@ -735,7 +1120,8 @@ app.post("/generate", premiumOnlyGuards, async (req, res) => {
     });
   }
 
-  const { requestedDays, cities, budgetKrw } = structured;
+  const { requestedDays, cities, budgetKrw, premiumProfile } = structured;
+  const isTailored = premium ? req.body?.isTailored !== false : false;
   const isMultiCity = cities.length > 1;
 
   if (!premium && requestedDays > FREE_MAX_DAYS) {
@@ -782,6 +1168,8 @@ app.post("/generate", premiumOnlyGuards, async (req, res) => {
     cities,
     budgetKrw,
     premium,
+    isTailored,
+    premiumProfile,
   });
 
   if (userPrompt.length > MAX_PROMPT_LENGTH) {
@@ -795,6 +1183,7 @@ app.post("/generate", premiumOnlyGuards, async (req, res) => {
   const result = await callOpenAI({
     userPrompt,
     premium,
+    isTailored,
     requestedDays,
     isMultiCity,
   });
@@ -821,6 +1210,8 @@ app.post("/generate", premiumOnlyGuards, async (req, res) => {
     cities,
     is_multi_city: isMultiCity,
     plan_type: premium ? "premium" : "free",
+    is_tailored: isTailored,
+    premium_profile: premium ? premiumProfile : null,
     tokens: result.tokens,
     input_tokens: result.inputTokens,
     output_tokens: result.outputTokens,
