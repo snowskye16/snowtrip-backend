@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { adminAuth, db, FieldValue } from "./firebaseAdmin.js";
 
 class HttpError extends Error {
@@ -9,6 +9,45 @@ class HttpError extends Error {
     this.extras = extras;
   }
 }
+
+const PURCHASE_PRODUCTS = new Map([
+  [
+    "snowtrip_premium_10",
+    {
+      kind: "credits",
+      credits: 10,
+    },
+  ],
+  [
+    "snowtrip_premium_30",
+    {
+      kind: "credits",
+      credits: 30,
+    },
+  ],
+  [
+    "snowtrip_trip_pass",
+    {
+      kind: "trip_pass",
+      days: 14,
+    },
+  ],
+]);
+
+const PURCHASE_VERIFICATION_MODE = (() => {
+  const configured = (
+    process.env.PURCHASE_VERIFICATION_MODE ||
+    (process.env.NODE_ENV === "production" ? "strict" : "trusted_test")
+  )
+    .trim()
+    .toLowerCase();
+
+  if (configured === "trusted_test" && process.env.NODE_ENV !== "production") {
+    return "trusted_test";
+  }
+
+  return "strict";
+})();
 
 function getBearerToken(req) {
   const header = req.headers.authorization ?? req.headers.Authorization;
@@ -33,12 +72,168 @@ function ledgerCollectionRef(uid) {
   return userRef(uid).collection("creditLedger");
 }
 
+function purchaseReceiptRef(fingerprint) {
+  return db.collection("premiumPurchases").doc(fingerprint);
+}
+
 function getRequestId(req) {
   const raw = req.headers["x-request-id"];
   if (typeof raw === "string" && raw.trim()) {
     return raw.trim();
   }
   return randomUUID();
+}
+
+function normalizeCreditCount(value) {
+  const premiumCredits = Number(value);
+  if (!Number.isFinite(premiumCredits) || premiumCredits <= 0) {
+    return 0;
+  }
+  return Math.floor(premiumCredits);
+}
+
+function normalizeDate(value) {
+  if (!value) return null;
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+
+  if (typeof value?.toDate === "function") {
+    return normalizeDate(value.toDate());
+  }
+
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function toIsoStringOrNull(value) {
+  const date = normalizeDate(value);
+  return date ? date.toISOString() : null;
+}
+
+function getPremiumStatusFromProfileSnap(profileSnap) {
+  const premiumCredits = normalizeCreditCount(
+    profileSnap.exists ? profileSnap.get("premiumCredits") || 0 : 0,
+  );
+  const tripPassExpiresAt = normalizeDate(
+    profileSnap.exists ? profileSnap.get("tripPassExpiresAt") : null,
+  );
+  const hasTripPass =
+    tripPassExpiresAt != null && tripPassExpiresAt.getTime() > Date.now();
+
+  return {
+    premiumCredits,
+    tripPassExpiresAt,
+    hasTripPass,
+    hasPremiumAccess: hasTripPass || premiumCredits > 0,
+  };
+}
+
+function buildPremiumStatusResponse(status, extras = {}) {
+  return {
+    premiumCredits: status.premiumCredits,
+    tripPassExpiresAt: toIsoStringOrNull(status.tripPassExpiresAt),
+    hasTripPass: status.hasTripPass,
+    hasPremiumAccess: status.hasPremiumAccess,
+    entitlementSource: "firestore",
+    ...extras,
+  };
+}
+
+function cleanString(value, { maxLength = 4000 } = {}) {
+  if (typeof value !== "string") return "";
+  const cleaned = value.trim();
+  if (!cleaned) return "";
+  return cleaned.slice(0, maxLength);
+}
+
+function createPurchaseFingerprint({
+  productId,
+  purchaseId,
+  verificationSource,
+  serverVerificationData,
+}) {
+  const raw = [
+    productId,
+    purchaseId,
+    verificationSource,
+    serverVerificationData,
+  ].join("|");
+
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+function normalizePurchasePayload(payload) {
+  const productId = cleanString(payload?.productId, { maxLength: 128 });
+  const purchaseId = cleanString(payload?.purchaseId, { maxLength: 256 });
+  const verificationSource = cleanString(payload?.verificationSource, {
+    maxLength: 64,
+  });
+  const serverVerificationData = cleanString(payload?.serverVerificationData, {
+    maxLength: 6000,
+  });
+  const localVerificationData = cleanString(payload?.localVerificationData, {
+    maxLength: 6000,
+  });
+  const transactionDate = cleanString(payload?.transactionDate, {
+    maxLength: 64,
+  });
+  const platform = cleanString(payload?.platform, { maxLength: 32 });
+  const purchaseStatus = cleanString(payload?.purchaseStatus, {
+    maxLength: 64,
+  });
+
+  if (!PURCHASE_PRODUCTS.has(productId)) {
+    throw new HttpError(400, "Unknown premium product.");
+  }
+
+  if (!purchaseId && !serverVerificationData) {
+    throw new HttpError(400, "Purchase proof is missing.");
+  }
+
+  if (!verificationSource) {
+    throw new HttpError(400, "Purchase verification source is missing.");
+  }
+
+  return {
+    productId,
+    purchaseId,
+    verificationSource,
+    serverVerificationData,
+    localVerificationData,
+    transactionDate,
+    platform,
+    purchaseStatus,
+  };
+}
+
+function ensurePurchaseVerificationIsConfigured() {
+  if (PURCHASE_VERIFICATION_MODE === "trusted_test") {
+    return "trusted_test_unverified";
+  }
+
+  throw new HttpError(
+    503,
+    "Store purchase verification is not configured for production yet.",
+    {
+      verification_not_configured: true,
+      purchase_verification_mode: PURCHASE_VERIFICATION_MODE,
+    },
+  );
+}
+
+export function getPurchaseVerificationMode() {
+  return PURCHASE_VERIFICATION_MODE;
+}
+
+export async function getPremiumStatus(uid) {
+  const profileSnap = await userRef(uid).get();
+  return getPremiumStatusFromProfileSnap(profileSnap);
+}
+
+export function serializePremiumStatus(status, extras = {}) {
+  return buildPremiumStatusResponse(status, extras);
 }
 
 export async function optionalFirebaseAuth(req, res, next) {
@@ -100,17 +295,34 @@ export async function reservePremiumCreditIfNeeded(req, res, next) {
     const result = await db.runTransaction(async (tx) => {
       const profileSnap = await tx.get(profileRef);
 
-      const premiumCredits = Number(
-        profileSnap.exists ? profileSnap.get("premiumCredits") || 0 : 0,
-      );
+      const status = getPremiumStatusFromProfileSnap(profileSnap);
 
-      if (premiumCredits < 1) {
+      if (status.hasTripPass) {
+        tx.set(
+          profileRef,
+          {
+            updatedAt: FieldValue.serverTimestamp(),
+            email: req.user.email ?? null,
+          },
+          { merge: true },
+        );
+
+        return {
+          reserved: false,
+          balanceAfter: status.premiumCredits,
+          requestId,
+          tripPassExpiresAt: status.tripPassExpiresAt,
+          hasTripPass: true,
+        };
+      }
+
+      if (status.premiumCredits < 1) {
         throw new HttpError(403, "No premium credits left.", {
           requires_purchase: true,
         });
       }
 
-      const balanceAfter = premiumCredits - 1;
+      const balanceAfter = status.premiumCredits - 1;
       const ledgerRef = ledgerCollectionRef(uid).doc();
 
       tx.set(
@@ -133,15 +345,20 @@ export async function reservePremiumCreditIfNeeded(req, res, next) {
       });
 
       return {
+        reserved: true,
         balanceAfter,
         requestId,
+        tripPassExpiresAt: status.tripPassExpiresAt,
+        hasTripPass: false,
       };
     });
 
     req.premiumCredit = {
-      reserved: true,
+      reserved: result.reserved,
       balanceAfter: result.balanceAfter,
       requestId: result.requestId,
+      tripPassExpiresAt: toIsoStringOrNull(result.tripPassExpiresAt),
+      hasTripPass: result.hasTripPass,
     };
 
     return next();
@@ -199,5 +416,124 @@ export async function refundPremiumCredit({
     });
 
     return balanceAfter;
+  });
+}
+
+export async function verifyAndGrantPremiumPurchase({
+  uid,
+  email = null,
+  payload,
+}) {
+  const purchase = normalizePurchasePayload(payload);
+  const product = PURCHASE_PRODUCTS.get(purchase.productId);
+  const verificationStatus = ensurePurchaseVerificationIsConfigured();
+  const fingerprint = createPurchaseFingerprint(purchase);
+  const profileRef = userRef(uid);
+  const receiptRef = purchaseReceiptRef(fingerprint);
+  const verificationTokenHash = createHash("sha256")
+    .update(purchase.serverVerificationData)
+    .digest("hex");
+
+  return db.runTransaction(async (tx) => {
+    const [profileSnap, receiptSnap] = await Promise.all([
+      tx.get(profileRef),
+      tx.get(receiptRef),
+    ]);
+
+    if (receiptSnap.exists) {
+      const existingUid = receiptSnap.get("uid");
+
+      if (typeof existingUid === "string" && existingUid && existingUid !== uid) {
+        throw new HttpError(
+          409,
+          "This purchase is already linked to another account.",
+        );
+      }
+
+      return {
+        ...getPremiumStatusFromProfileSnap(profileSnap),
+        alreadyProcessed: true,
+        grantedProductId: receiptSnap.get("productId") || purchase.productId,
+        verificationStatus:
+          receiptSnap.get("verificationStatus") || verificationStatus,
+      };
+    }
+
+    const currentStatus = getPremiumStatusFromProfileSnap(profileSnap);
+    let premiumCredits = currentStatus.premiumCredits;
+    let tripPassExpiresAt = currentStatus.tripPassExpiresAt;
+
+    if (product.kind === "credits") {
+      premiumCredits += product.credits;
+    } else {
+      const now = new Date();
+      const base =
+        tripPassExpiresAt != null && tripPassExpiresAt.getTime() > now.getTime()
+          ? tripPassExpiresAt
+          : now;
+
+      tripPassExpiresAt = new Date(
+        base.getTime() + product.days * 24 * 60 * 60 * 1000,
+      );
+    }
+
+    const balanceAfter = premiumCredits;
+    const ledgerRef = ledgerCollectionRef(uid).doc();
+
+    tx.set(
+      profileRef,
+      {
+        premiumCredits,
+        tripPassExpiresAt: tripPassExpiresAt ?? null,
+        updatedAt: FieldValue.serverTimestamp(),
+        email,
+      },
+      { merge: true },
+    );
+
+    tx.set(ledgerRef, {
+      type:
+        product.kind === "credits" ? "purchase_credit" : "purchase_trip_pass",
+      amount: product.kind === "credits" ? product.credits : 0,
+      balanceAfter,
+      productId: purchase.productId,
+      purchaseId: purchase.purchaseId || null,
+      purchaseStatus: purchase.purchaseStatus || null,
+      verificationSource: purchase.verificationSource,
+      verificationStatus,
+      tripPassExpiresAt: tripPassExpiresAt ?? null,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    tx.set(receiptRef, {
+      uid,
+      productId: purchase.productId,
+      productKind: product.kind,
+      purchaseId: purchase.purchaseId || null,
+      purchaseStatus: purchase.purchaseStatus || null,
+      platform: purchase.platform || null,
+      transactionDate: purchase.transactionDate || null,
+      verificationSource: purchase.verificationSource,
+      verificationStatus,
+      verificationTokenHash,
+      grantedCredits: product.kind === "credits" ? product.credits : 0,
+      grantedTripPassDays: product.kind === "trip_pass" ? product.days : 0,
+      tripPassExpiresAt: tripPassExpiresAt ?? null,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    return {
+      premiumCredits,
+      tripPassExpiresAt,
+      hasTripPass:
+        tripPassExpiresAt != null && tripPassExpiresAt.getTime() > Date.now(),
+      hasPremiumAccess:
+        premiumCredits > 0 ||
+        (tripPassExpiresAt != null &&
+            tripPassExpiresAt.getTime() > Date.now()),
+      alreadyProcessed: false,
+      grantedProductId: purchase.productId,
+      verificationStatus,
+    };
   });
 }

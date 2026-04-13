@@ -12,9 +12,13 @@ import {
   toggleTodayLike,
 } from "./src/todaySocial.js";
 import {
+  getPremiumStatus,
+  getPurchaseVerificationMode,
   optionalFirebaseAuth,
   reservePremiumCreditIfNeeded,
   refundPremiumCredit,
+  serializePremiumStatus,
+  verifyAndGrantPremiumPurchase,
 } from "./premiumAuth.js";
 
 
@@ -912,6 +916,24 @@ function requireAuthenticatedUser(req, res, next) {
   });
 }
 
+function requirePremiumEligibleUser(req, res, next) {
+  if (!req.user?.uid) {
+    return res.status(401).json({
+      error: "Authentication required.",
+      requires_login: true,
+    });
+  }
+
+  if (req.user.isAnonymous) {
+    return res.status(401).json({
+      error: "Please sign in with a real account to use premium.",
+      requires_login: true,
+    });
+  }
+
+  return next();
+}
+
 function getUserDisplayName(req) {
   const displayName = req.user?.displayName;
   if (typeof displayName === "string" && displayName.trim()) {
@@ -1070,8 +1092,68 @@ app.get("/health", (_req, res) => {
     free_requests_per_day: FREE_REQUESTS_PER_DAY,
     max_days: MAX_DAYS,
     max_cities: MAX_CITIES,
+    purchase_verification_mode: getPurchaseVerificationMode(),
   });
 });
+
+app.get(
+  "/premium/status",
+  optionalFirebaseAuth,
+  requirePremiumEligibleUser,
+  async (req, res) => {
+    try {
+      const status = await getPremiumStatus(req.user.uid);
+
+      return res.json(
+        serializePremiumStatus(status, {
+          uid: req.user.uid,
+        }),
+      );
+    } catch (error) {
+      console.error("Could not load premium status:", error);
+      return res.status(503).json({
+        error: "Could not load premium status.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/premium/verify-purchase",
+  optionalFirebaseAuth,
+  requirePremiumEligibleUser,
+  async (req, res) => {
+    try {
+      const status = await verifyAndGrantPremiumPurchase({
+        uid: req.user.uid,
+        email: req.user.email ?? null,
+        payload: req.body,
+      });
+
+      return res.json(
+        serializePremiumStatus(status, {
+          uid: req.user.uid,
+          grantedProductId: status.grantedProductId,
+          alreadyProcessed: status.alreadyProcessed,
+          verificationStatus: status.verificationStatus,
+          purchaseVerificationMode: getPurchaseVerificationMode(),
+        }),
+      );
+    } catch (error) {
+      if (error?.status) {
+        return res.status(error.status).json({
+          error: error.message,
+          ...(error.extras || {}),
+        });
+      }
+
+      console.error("Could not verify purchase:", error);
+      return res.status(503).json({
+        error: "Could not verify purchase.",
+      });
+    }
+  },
+);
 
 app.post("/generate", premiumOnlyGuards, async (req, res) => {
   const startedAt = Date.now();
@@ -1222,6 +1304,15 @@ app.post("/generate", premiumOnlyGuards, async (req, res) => {
     premium_credits_remaining: premium
       ? req.premiumCredit?.balanceAfter ?? null
       : null,
+    trip_pass_expires_at: premium
+      ? req.premiumCredit?.tripPassExpiresAt ?? null
+      : null,
+    has_trip_pass: premium ? req.premiumCredit?.hasTripPass === true : false,
+    has_premium_access: premium
+      ? req.premiumCredit?.hasTripPass === true ||
+          (req.premiumCredit?.balanceAfter ?? 0) > 0
+      : false,
+    premium_entitlement_source: premium ? "firestore" : null,
     uid: req.user?.uid ?? null,
   });
 });
