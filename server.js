@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
+import { adminAppCheck } from "./firebaseAdmin.js";
 import { listTodayItems } from './src/airtableToday.js';
 import {
   TodaySocialError,
@@ -13,7 +14,6 @@ import {
 } from "./src/todaySocial.js";
 import {
   getPremiumStatus,
-  getPurchaseVerificationMode,
   optionalFirebaseAuth,
   reservePremiumCreditIfNeeded,
   refundPremiumCredit,
@@ -46,6 +46,12 @@ const FREE_WINDOW_MS = Number(
   process.env.FREE_WINDOW_MS || 24 * 60 * 60 * 1000,
 );
 const MAX_CITIES = Number(process.env.MAX_CITIES || 3);
+const APP_CHECK_MODE = (
+  process.env.FIREBASE_APP_CHECK_MODE ||
+  (process.env.NODE_ENV === "production" ? "warn" : "off")
+)
+  .trim()
+  .toLowerCase();
 
 // In-memory quota store for MVP / single server.
 const freeUsageByClient = new Map();
@@ -102,7 +108,12 @@ app.use(
       return callback(new Error("Not allowed by CORS"));
     },
     methods: ["GET", "POST", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Accept", "Authorization"],
+    allowedHeaders: [
+      "Content-Type",
+      "Accept",
+      "Authorization",
+      "X-Firebase-AppCheck",
+    ],
   }),
 );
 
@@ -114,7 +125,26 @@ const limiter = rateLimit({
   message: { error: "Too many requests. Slow down." },
 });
 
+const premiumLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many premium requests. Slow down." },
+});
+
+const socialLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 80,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Slow down." },
+});
+
 app.use("/generate", limiter);
+app.use("/premium", premiumLimiter);
+app.use("/comments", socialLimiter);
+app.use("/today-items", socialLimiter);
 
 // ── Prompting ──────────────────────────────────────────────────
 
@@ -635,12 +665,57 @@ function buildContinuationPrompt({ premium, isTailored, requestedDays }) {
 }
 
 function getClientId(req) {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded.trim()) {
-    return forwarded.split(",")[0].trim();
+  if (req.user?.uid) {
+    return `uid:${req.user.uid}`;
   }
 
   return req.ip || req.socket?.remoteAddress || "unknown";
+}
+
+async function optionalAppCheck(req, res, next) {
+  if (APP_CHECK_MODE === "off") {
+    req.appCheck = { verified: false, present: false, mode: APP_CHECK_MODE };
+    return next();
+  }
+
+  const rawToken =
+    req.headers["x-firebase-appcheck"] ?? req.headers["X-Firebase-AppCheck"];
+
+  if (typeof rawToken !== "string" || !rawToken.trim()) {
+    req.appCheck = { verified: false, present: false, mode: APP_CHECK_MODE };
+
+    if (APP_CHECK_MODE === "required") {
+      return res.status(401).json({
+        error: "App integrity check failed. Update Snowtrip and try again.",
+        requires_app_check: true,
+      });
+    }
+
+    return next();
+  }
+
+  try {
+    const decoded = await adminAppCheck.verifyToken(rawToken.trim());
+    req.appCheck = {
+      verified: true,
+      present: true,
+      mode: APP_CHECK_MODE,
+      appId: decoded.app_id || decoded.sub || null,
+    };
+    return next();
+  } catch (error) {
+    console.error("verifyAppCheckToken failed:", error?.message || error);
+    req.appCheck = { verified: false, present: true, mode: APP_CHECK_MODE };
+
+    if (APP_CHECK_MODE === "required") {
+      return res.status(401).json({
+        error: "App integrity check failed. Update Snowtrip and try again.",
+        requires_app_check: true,
+      });
+    }
+
+    return next();
+  }
 }
 
 function pruneOldFreeUsage(clientId) {
@@ -876,15 +951,17 @@ function runMiddleware(req, res, middleware) {
 }
 
 async function premiumOnlyGuards(req, res, next) {
-  const premium = req.body?.premium === true;
-
-  if (!premium) {
-    req.user = null;
-    req.premiumCredit = null;
-    return next();
-  }
-
   try {
+    await runMiddleware(req, res, optionalAppCheck);
+    if (res.headersSent) return;
+
+    const premium = req.body?.premium === true;
+    if (!premium) {
+      req.user = null;
+      req.premiumCredit = null;
+      return next();
+    }
+
     await runMiddleware(req, res, optionalFirebaseAuth);
     if (res.headersSent) return;
 
@@ -974,10 +1051,15 @@ app.get('/today-items', async (req, res) => {
     res.json({ items });
   } catch (error) {
     console.error('Could not load today items:', error);
-    res.status(500).json({
+    const response = {
       error: 'Could not load today items',
-      message: error.message,
-    });
+    };
+
+    if (process.env.NODE_ENV !== "production") {
+      response.details = error?.message;
+    }
+
+    res.status(500).json(response);
   }
 });
 
@@ -1008,6 +1090,7 @@ app.get("/today-items/:id/comments", async (req, res) => {
 
 app.post(
   "/today-items/:id/comments",
+  optionalAppCheck,
   optionalFirebaseAuth,
   requireAuthenticatedUser,
   async (req, res) => {
@@ -1028,6 +1111,7 @@ app.post(
 
 app.delete(
   "/comments/:id",
+  optionalAppCheck,
   optionalFirebaseAuth,
   requireAuthenticatedUser,
   async (req, res) => {
@@ -1046,6 +1130,7 @@ app.delete(
 
 app.post(
   "/comments/:id/report",
+  optionalAppCheck,
   optionalFirebaseAuth,
   requireAuthenticatedUser,
   async (req, res) => {
@@ -1065,6 +1150,7 @@ app.post(
 
 app.post(
   "/today-items/:id/like",
+  optionalAppCheck,
   optionalFirebaseAuth,
   requireAuthenticatedUser,
   async (req, res) => {
@@ -1084,20 +1170,13 @@ app.post(
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
-    hasKey: Boolean(OPENAI_API_KEY),
-    freeModel: FREE_MODEL,
-    premiumModel: PREMIUM_MODEL,
-    timeout_ms: OPENAI_TIMEOUT_MS,
-    free_max_days: FREE_MAX_DAYS,
-    free_requests_per_day: FREE_REQUESTS_PER_DAY,
-    max_days: MAX_DAYS,
-    max_cities: MAX_CITIES,
-    purchase_verification_mode: getPurchaseVerificationMode(),
+    uptime_seconds: Math.round(process.uptime()),
   });
 });
 
 app.get(
   "/premium/status",
+  optionalAppCheck,
   optionalFirebaseAuth,
   requirePremiumEligibleUser,
   async (req, res) => {
@@ -1120,6 +1199,7 @@ app.get(
 
 app.post(
   "/premium/verify-purchase",
+  optionalAppCheck,
   optionalFirebaseAuth,
   requirePremiumEligibleUser,
   async (req, res) => {
@@ -1136,7 +1216,7 @@ app.post(
           grantedProductId: status.grantedProductId,
           alreadyProcessed: status.alreadyProcessed,
           verificationStatus: status.verificationStatus,
-          purchaseVerificationMode: getPurchaseVerificationMode(),
+          googlePlayOrderId: status.googlePlayOrderId ?? null,
         }),
       );
     } catch (error) {

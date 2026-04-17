@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from "node:crypto";
-import { adminAuth, db, FieldValue } from "./firebaseAdmin.js";
+import { createHash, createSign, randomUUID } from "node:crypto";
+import { adminAuth, db, FieldValue, serviceAccountInfo } from "./firebaseAdmin.js";
 
 class HttpError extends Error {
   constructor(status, message, extras = {}) {
@@ -48,6 +48,12 @@ const PURCHASE_VERIFICATION_MODE = (() => {
 
   return "strict";
 })();
+
+const GOOGLE_PLAY_PACKAGE_NAME =
+  process.env.GOOGLE_PLAY_PACKAGE_NAME?.trim() || "app.snowtrip.planner";
+const GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const GOOGLE_ANDROID_PUBLISHER_SCOPE =
+  "https://www.googleapis.com/auth/androidpublisher";
 
 function getBearerToken(req) {
   const header = req.headers.authorization ?? req.headers.Authorization;
@@ -164,6 +170,186 @@ function createPurchaseFingerprint({
   return createHash("sha256").update(raw).digest("hex");
 }
 
+function encodeBase64Url(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+function getGooglePlayServiceAccount() {
+  const clientEmail = serviceAccountInfo?.client_email?.trim();
+  const privateKey = serviceAccountInfo?.private_key;
+
+  if (!clientEmail || !privateKey) {
+    throw new HttpError(
+      503,
+      "Google Play purchase verification is not configured yet.",
+      {
+        verification_not_configured: true,
+        purchase_verification_mode: PURCHASE_VERIFICATION_MODE,
+      },
+    );
+  }
+
+  return {
+    clientEmail,
+    privateKey,
+  };
+}
+
+async function getGooglePlayAccessToken() {
+  const { clientEmail, privateKey } = getGooglePlayServiceAccount();
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const assertionHeader = encodeBase64Url(
+    JSON.stringify({ alg: "RS256", typ: "JWT" }),
+  );
+  const assertionPayload = encodeBase64Url(
+    JSON.stringify({
+      iss: clientEmail,
+      scope: GOOGLE_ANDROID_PUBLISHER_SCOPE,
+      aud: GOOGLE_OAUTH_TOKEN_URL,
+      exp: nowSeconds + 3600,
+      iat: nowSeconds,
+    }),
+  );
+  const unsignedAssertion = `${assertionHeader}.${assertionPayload}`;
+  const signer = createSign("RSA-SHA256");
+
+  signer.update(unsignedAssertion);
+  signer.end();
+
+  const signature = signer.sign(privateKey, "base64url");
+  const body = new URLSearchParams({
+    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    assertion: `${unsignedAssertion}.${signature}`,
+  });
+
+  const response = await fetch(GOOGLE_OAUTH_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    },
+    body,
+  });
+
+  if (!response.ok) {
+    const details = await response.text();
+    console.error("Google OAuth token request failed:", details);
+    throw new HttpError(
+      503,
+      "Google Play purchase verification is unavailable right now.",
+      {
+        verification_temporarily_unavailable: true,
+      },
+    );
+  }
+
+  const payload = await response.json();
+  const accessToken = cleanString(payload?.access_token, { maxLength: 4096 });
+
+  if (!accessToken) {
+    throw new HttpError(
+      503,
+      "Google Play purchase verification is unavailable right now.",
+      {
+        verification_temporarily_unavailable: true,
+      },
+    );
+  }
+
+  return accessToken;
+}
+
+function validateAndroidPurchasePayload(purchase) {
+  const platform = purchase.platform.toLowerCase();
+  const verificationSource = purchase.verificationSource.toLowerCase();
+  const purchaseStatus = purchase.purchaseStatus.toLowerCase();
+
+  if (platform && platform !== "android") {
+    throw new HttpError(400, "Only Android Google Play purchases are supported.");
+  }
+
+  if (verificationSource && !verificationSource.includes("play")) {
+    throw new HttpError(400, "Unsupported purchase verification source.");
+  }
+
+  if (
+    purchaseStatus &&
+    purchaseStatus !== "purchased" &&
+    purchaseStatus !== "restored"
+  ) {
+    throw new HttpError(409, "Purchase is not ready to verify yet.", {
+      purchase_not_ready: true,
+      purchase_status: purchase.purchaseStatus,
+    });
+  }
+}
+
+async function verifyAndroidPurchaseWithGooglePlay(purchase) {
+  validateAndroidPurchasePayload(purchase);
+
+  const accessToken = await getGooglePlayAccessToken();
+  const encodedPackage = encodeURIComponent(GOOGLE_PLAY_PACKAGE_NAME);
+  const encodedProductId = encodeURIComponent(purchase.productId);
+  const encodedToken = encodeURIComponent(purchase.serverVerificationData);
+  const response = await fetch(
+    `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodedPackage}/purchases/products/${encodedProductId}/tokens/${encodedToken}`,
+    {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+      },
+    },
+  );
+
+  if (response.status === 404) {
+    throw new HttpError(400, "Google Play could not find this purchase.");
+  }
+
+  if (!response.ok) {
+    const details = await response.text();
+    console.error("Google Play product verification failed:", details);
+    throw new HttpError(
+      503,
+      "Google Play purchase verification is unavailable right now.",
+      {
+        verification_temporarily_unavailable: true,
+      },
+    );
+  }
+
+  const payload = await response.json();
+  const purchaseState = Number(payload?.purchaseState);
+
+  if (!Number.isFinite(purchaseState) || purchaseState !== 0) {
+    throw new HttpError(
+      purchaseState === 2 ? 409 : 400,
+      purchaseState === 2
+        ? "Purchase is still pending in Google Play."
+        : "Google Play did not confirm this purchase.",
+      {
+        purchase_not_ready: purchaseState === 2,
+        purchase_state: purchaseState,
+      },
+    );
+  }
+
+  return {
+    verificationStatus: "google_play_verified",
+    verificationDetails: {
+      packageName: GOOGLE_PLAY_PACKAGE_NAME,
+      orderId: cleanString(payload?.orderId, { maxLength: 256 }),
+      purchaseState,
+      purchaseTimeMillis: cleanString(payload?.purchaseTimeMillis, {
+        maxLength: 64,
+      }),
+      acknowledgementState: Number(payload?.acknowledgementState ?? -1),
+      consumptionState: Number(payload?.consumptionState ?? -1),
+      kind: cleanString(payload?.kind, { maxLength: 128 }),
+    },
+  };
+}
+
 function normalizePurchasePayload(payload) {
   const productId = cleanString(payload?.productId, { maxLength: 128 });
   const purchaseId = cleanString(payload?.purchaseId, { maxLength: 256 });
@@ -210,17 +396,24 @@ function normalizePurchasePayload(payload) {
 
 function ensurePurchaseVerificationIsConfigured() {
   if (PURCHASE_VERIFICATION_MODE === "trusted_test") {
-    return "trusted_test_unverified";
+    return {
+      verificationStatus: "trusted_test_unverified",
+      verificationDetails: null,
+    };
   }
 
-  throw new HttpError(
-    503,
-    "Store purchase verification is not configured for production yet.",
-    {
-      verification_not_configured: true,
-      purchase_verification_mode: PURCHASE_VERIFICATION_MODE,
-    },
-  );
+  if (!GOOGLE_PLAY_PACKAGE_NAME) {
+    throw new HttpError(
+      503,
+      "Google Play purchase verification is not configured yet.",
+      {
+        verification_not_configured: true,
+        purchase_verification_mode: PURCHASE_VERIFICATION_MODE,
+      },
+    );
+  }
+
+  return null;
 }
 
 export function getPurchaseVerificationMode() {
@@ -426,7 +619,11 @@ export async function verifyAndGrantPremiumPurchase({
 }) {
   const purchase = normalizePurchasePayload(payload);
   const product = PURCHASE_PRODUCTS.get(purchase.productId);
-  const verificationStatus = ensurePurchaseVerificationIsConfigured();
+  const trustedTestVerification = ensurePurchaseVerificationIsConfigured();
+  const verifiedPurchase = trustedTestVerification ??
+    (await verifyAndroidPurchaseWithGooglePlay(purchase));
+  const verificationStatus = verifiedPurchase.verificationStatus;
+  const verificationDetails = verifiedPurchase.verificationDetails;
   const fingerprint = createPurchaseFingerprint(purchase);
   const profileRef = userRef(uid);
   const receiptRef = purchaseReceiptRef(fingerprint);
@@ -456,6 +653,7 @@ export async function verifyAndGrantPremiumPurchase({
         grantedProductId: receiptSnap.get("productId") || purchase.productId,
         verificationStatus:
           receiptSnap.get("verificationStatus") || verificationStatus,
+        googlePlayOrderId: receiptSnap.get("googlePlayOrderId") || null,
       };
     }
 
@@ -501,6 +699,12 @@ export async function verifyAndGrantPremiumPurchase({
       purchaseStatus: purchase.purchaseStatus || null,
       verificationSource: purchase.verificationSource,
       verificationStatus,
+      googlePlayOrderId: verificationDetails?.orderId || null,
+      googlePlayPurchaseState: verificationDetails?.purchaseState ?? null,
+      googlePlayConsumptionState:
+        verificationDetails?.consumptionState ?? null,
+      googlePlayAcknowledgementState:
+        verificationDetails?.acknowledgementState ?? null,
       tripPassExpiresAt: tripPassExpiresAt ?? null,
       createdAt: FieldValue.serverTimestamp(),
     });
@@ -515,10 +719,20 @@ export async function verifyAndGrantPremiumPurchase({
       transactionDate: purchase.transactionDate || null,
       verificationSource: purchase.verificationSource,
       verificationStatus,
+      verificationPackageName: verificationDetails?.packageName || null,
+      googlePlayOrderId: verificationDetails?.orderId || null,
+      googlePlayPurchaseState: verificationDetails?.purchaseState ?? null,
+      googlePlayPurchaseTimeMillis:
+        verificationDetails?.purchaseTimeMillis || null,
+      googlePlayConsumptionState:
+        verificationDetails?.consumptionState ?? null,
+      googlePlayAcknowledgementState:
+        verificationDetails?.acknowledgementState ?? null,
       verificationTokenHash,
       grantedCredits: product.kind === "credits" ? product.credits : 0,
       grantedTripPassDays: product.kind === "trip_pass" ? product.days : 0,
       tripPassExpiresAt: tripPassExpiresAt ?? null,
+      verifiedAt: FieldValue.serverTimestamp(),
       createdAt: FieldValue.serverTimestamp(),
     });
 
@@ -534,6 +748,7 @@ export async function verifyAndGrantPremiumPurchase({
       alreadyProcessed: false,
       grantedProductId: purchase.productId,
       verificationStatus,
+      googlePlayOrderId: verificationDetails?.orderId || null,
     };
   });
 }
