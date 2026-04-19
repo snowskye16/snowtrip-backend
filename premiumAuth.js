@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { createHash, createSign, randomUUID } from "node:crypto";
 import { adminAuth, db, FieldValue, serviceAccountInfo } from "./firebaseAdmin.js";
 
@@ -55,6 +57,45 @@ const GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_ANDROID_PUBLISHER_SCOPE =
   "https://www.googleapis.com/auth/androidpublisher";
 
+function parseServiceAccountInfo(raw) {
+  if (typeof raw !== "string" || !raw.trim()) {
+    return null;
+  }
+
+  const parsed = JSON.parse(raw);
+  if (typeof parsed.private_key === "string") {
+    parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+  }
+
+  return parsed;
+}
+
+function loadGooglePlayServiceAccountInfo() {
+  const localKeyPath = path.resolve(
+    process.cwd(),
+    "googlePlayServiceAccountKey.json",
+  );
+  if (fs.existsSync(localKeyPath)) {
+    return parseServiceAccountInfo(fs.readFileSync(localKeyPath, "utf8"));
+  }
+
+  if (process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON) {
+    return parseServiceAccountInfo(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON);
+  }
+
+  if (process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH) {
+    const resolvedPath = path.resolve(
+      process.cwd(),
+      process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH,
+    );
+    return parseServiceAccountInfo(fs.readFileSync(resolvedPath, "utf8"));
+  }
+
+  return serviceAccountInfo;
+}
+
+const googlePlayServiceAccountInfo = loadGooglePlayServiceAccountInfo();
+
 function getBearerToken(req) {
   const header = req.headers.authorization ?? req.headers.Authorization;
 
@@ -80,6 +121,15 @@ function ledgerCollectionRef(uid) {
 
 function purchaseReceiptRef(fingerprint) {
   return db.collection("premiumPurchases").doc(fingerprint);
+}
+
+function refundLedgerRef(uid, requestId) {
+  const normalizedRequestId = cleanString(requestId, { maxLength: 512 });
+  const fingerprint = createHash("sha256")
+    .update(normalizedRequestId)
+    .digest("hex");
+
+  return ledgerCollectionRef(uid).doc(`generate_refund_${fingerprint}`);
 }
 
 function getRequestId(req) {
@@ -175,8 +225,8 @@ function encodeBase64Url(value) {
 }
 
 function getGooglePlayServiceAccount() {
-  const clientEmail = serviceAccountInfo?.client_email?.trim();
-  const privateKey = serviceAccountInfo?.private_key;
+  const clientEmail = googlePlayServiceAccountInfo?.client_email?.trim();
+  const privateKey = googlePlayServiceAccountInfo?.private_key;
 
   if (!clientEmail || !privateKey) {
     throw new HttpError(
@@ -577,17 +627,30 @@ export async function refundPremiumCredit({
   reason = "generate_failed",
 }) {
   const profileRef = userRef(uid);
+  const normalizedRequestId = cleanString(requestId, { maxLength: 512 });
+
+  if (!normalizedRequestId) {
+    throw new Error("requestId is required for premium credit refunds.");
+  }
+
+  const existingRefundRef = refundLedgerRef(uid, normalizedRequestId);
 
   return db.runTransaction(async (tx) => {
-    const profileSnap = await tx.get(profileRef);
+    const [profileSnap, existingRefundSnap] = await Promise.all([
+      tx.get(profileRef),
+      tx.get(existingRefundRef),
+    ]);
 
     if (!profileSnap.exists) {
       throw new Error("User profile not found during refund.");
     }
 
+    if (existingRefundSnap.exists) {
+      return Number(profileSnap.get("premiumCredits") || 0);
+    }
+
     const premiumCredits = Number(profileSnap.get("premiumCredits") || 0);
     const balanceAfter = premiumCredits + 1;
-    const ledgerRef = ledgerCollectionRef(uid).doc();
 
     tx.set(
       profileRef,
@@ -598,11 +661,11 @@ export async function refundPremiumCredit({
       { merge: true },
     );
 
-    tx.set(ledgerRef, {
+    tx.set(existingRefundRef, {
       type: "generate_refund",
       amount: 1,
       balanceAfter,
-      requestId,
+      requestId: normalizedRequestId,
       reason,
       route: "/generate",
       createdAt: FieldValue.serverTimestamp(),

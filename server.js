@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import { adminAppCheck } from "./firebaseAdmin.js";
 import { listTodayItems } from './src/airtableToday.js';
 import {
+  buildTodaySocialState,
   TodaySocialError,
   createCommentReport,
   createTodayComment,
@@ -1048,7 +1049,26 @@ app.get("/", (_req, res) => {
 app.get('/today-items', async (req, res) => {
   try {
     const items = await listTodayItems({ city: req.query.city });
-    res.json({ items });
+    try {
+      const socialStateByPlaceId = await buildTodaySocialState(
+        items.map((item) => item.recordId),
+      );
+
+      return res.json({
+        items: items.map((item) => ({
+          ...item,
+          ...(socialStateByPlaceId.get(item.recordId) || {}),
+        })),
+        socialStateAvailable: true,
+      });
+    } catch (socialError) {
+      console.error("Could not load today social state:", socialError);
+
+      return res.json({
+        items,
+        socialStateAvailable: false,
+      });
+    }
   } catch (error) {
     console.error('Could not load today items:', error);
     const response = {

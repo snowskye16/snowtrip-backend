@@ -141,6 +141,63 @@ function getLikeDocumentId(featuredPlaceId, userId) {
   return Buffer.from(`${featuredPlaceId}:${userId}`).toString("base64url");
 }
 
+function chunkList(items, size = 10) {
+  const chunks = [];
+
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+
+  return chunks;
+}
+
+function createSocialStateEntry() {
+  return {
+    likeCount: 0,
+    commentCount: 0,
+    isLiked: false,
+  };
+}
+
+export async function buildTodaySocialState(featuredPlaceIds) {
+  const normalizedIds = [...new Set(
+    (Array.isArray(featuredPlaceIds) ? featuredPlaceIds : [])
+      .map((value) => (typeof value === "string" ? value.trim() : ""))
+      .filter(Boolean),
+  )];
+  const socialStateByPlaceId = new Map(
+    normalizedIds.map((id) => [id, createSocialStateEntry()]),
+  );
+
+  for (const chunk of chunkList(normalizedIds)) {
+    const [commentSnapshot, likeSnapshot] = await Promise.all([
+      commentsCollection().where("featuredPlaceId", "in", chunk).get(),
+      likesCollection().where("featuredPlaceId", "in", chunk).get(),
+    ]);
+
+    for (const doc of commentSnapshot.docs) {
+      const data = doc.data() || {};
+      const featuredPlaceId = String(data.featuredPlaceId || "");
+      if (!socialStateByPlaceId.has(featuredPlaceId)) continue;
+      if (String(data.status || COMMENT_STATUS_ACTIVE) !== COMMENT_STATUS_ACTIVE) {
+        continue;
+      }
+
+      socialStateByPlaceId.get(featuredPlaceId).commentCount += 1;
+    }
+
+    for (const doc of likeSnapshot.docs) {
+      const data = doc.data() || {};
+      const featuredPlaceId = String(data.featuredPlaceId || "");
+      if (!socialStateByPlaceId.has(featuredPlaceId)) continue;
+
+      socialStateByPlaceId.get(featuredPlaceId).likeCount += 1;
+    }
+  }
+
+  return socialStateByPlaceId;
+}
+
 export async function listActiveComments(featuredPlaceId) {
   const normalizedFeaturedPlaceId = normalizeRequiredString(
     featuredPlaceId,
